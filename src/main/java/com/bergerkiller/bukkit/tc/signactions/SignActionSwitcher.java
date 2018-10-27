@@ -1,11 +1,9 @@
 package com.bergerkiller.bukkit.tc.signactions;
 
 import com.bergerkiller.bukkit.common.collections.BlockMap;
-import com.bergerkiller.bukkit.common.utils.BlockUtil;
 import com.bergerkiller.bukkit.common.utils.LogicUtil;
-import com.bergerkiller.bukkit.common.utils.MaterialUtil;
-import com.bergerkiller.bukkit.tc.Direction;
 import com.bergerkiller.bukkit.tc.DirectionStatement;
+import com.bergerkiller.bukkit.tc.Localization;
 import com.bergerkiller.bukkit.tc.Permission;
 import com.bergerkiller.bukkit.tc.actions.GroupActionWaitPathFinding;
 import com.bergerkiller.bukkit.tc.events.SignActionEvent;
@@ -15,11 +13,11 @@ import com.bergerkiller.bukkit.tc.pathfinding.PathNode;
 import com.bergerkiller.bukkit.tc.pathfinding.PathProvider;
 import com.bergerkiller.bukkit.tc.properties.IProperties;
 import org.bukkit.block.Block;
-import org.bukkit.block.BlockFace;
 import org.bukkit.block.Sign;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public class SignActionSwitcher extends SignAction {
@@ -41,6 +39,7 @@ public class SignActionSwitcher extends SignAction {
 
     @Override
     public void execute(SignActionEvent info) {
+        boolean toggleRails = info.isAction(SignActionType.GROUP_ENTER, SignActionType.MEMBER_ENTER);
         boolean doCart = false;
         boolean doTrain = false;
         if (info.isAction(SignActionType.GROUP_ENTER, SignActionType.GROUP_UPDATE) && info.isTrainSign()) {
@@ -61,17 +60,16 @@ public class SignActionSwitcher extends SignAction {
         }
         final boolean facing = info.isFacing();
         if (facing) {
-            final BlockFace cartDirection = info.getCartDirection();
             //find out what statements to parse
             List<DirectionStatement> statements = new ArrayList<>();
-            statements.add(new DirectionStatement(info.getLine(2), cartDirection, Direction.LEFT));
-            statements.add(new DirectionStatement(info.getLine(3), cartDirection, Direction.RIGHT));
+            statements.add(new DirectionStatement(info.getLine(2), "left"));
+            statements.add(new DirectionStatement(info.getLine(3), "right"));
             //other signs below this sign we could parse?
             for (Sign sign : info.findSignsBelow()) {
                 boolean valid = true;
                 for (String line : sign.getLines()) {
-                    DirectionStatement stat = new DirectionStatement(line, cartDirection);
-                    if (stat.direction == Direction.NONE) {
+                    DirectionStatement stat = new DirectionStatement(line, "");
+                    if (stat.direction.isEmpty()) {
                         valid = false;
                         break;
                     } else {
@@ -82,28 +80,14 @@ public class SignActionSwitcher extends SignAction {
                     break;
                 }
             }
-            Block signblock = info.getBlock();
-            while (MaterialUtil.ISSIGN.get(signblock = signblock.getRelative(BlockFace.DOWN))) {
-                Sign sign = BlockUtil.getSign(signblock);
-                if (sign == null) break;
-                boolean valid = true;
-                for (String line : sign.getLines()) {
-                    DirectionStatement stat = new DirectionStatement(line, cartDirection);
-                    if (stat.direction == Direction.NONE) {
-                        valid = false;
-                        break;
-                    } else {
-                        statements.add(stat);
-                    }
-                }
-                if (!valid) break;
-            }
+
             //parse all of the statements
             //are we going to use a counter?
             int maxcount = 0;
             int currentcount = 0;
             AtomicInteger signcounter = null;
             for (DirectionStatement stat : statements) {
+                //System.out.println(stat.toString());
                 if (stat.hasNumber()) {
                     maxcount += stat.number;
                     if (signcounter == null) {
@@ -122,20 +106,35 @@ public class SignActionSwitcher extends SignAction {
             }
 
             int counter = 0;
-            Direction dir = Direction.NONE;
+            String dir = "";
+            boolean foundDirection = false;
             for (DirectionStatement stat : statements) {
                 if ((stat.hasNumber() && (counter += stat.number) > currentcount)
                         || (doCart && stat.has(info, info.getMember()))
                         || (doTrain && stat.has(info, info.getGroup()))) {
 
                     dir = stat.direction;
+                    foundDirection = true;
                     break;
                 }
             }
-            info.setLevers(dir != Direction.NONE);
-            if (dir != Direction.NONE && info.isPowered()) {
+            if (!foundDirection) {
+                // Check if any direction is marked "default"
+                for (DirectionStatement stat : statements) {
+                    String str = stat.text.toLowerCase(Locale.ENGLISH);
+                    if (str.equals("def") || str.equals("default")) {
+                        dir = stat.direction;
+                        break;
+                    }
+                }
+            }
+
+            info.setLevers(!dir.isEmpty());
+            if (!dir.isEmpty() && info.isPowered()) {
                 //handle this direction
-                info.setRailsTo(dir);
+                if (toggleRails) {
+                    info.setRailsTo(dir);
+                }
                 return; //don't do destination stuff
             }
         }
@@ -168,7 +167,11 @@ public class SignActionSwitcher extends SignAction {
                         // Switch the rails to the right direction
                         PathConnection conn = node.findConnection(destination);
                         if (conn != null) {
-                            info.setRailsTo(conn.direction);
+                            if (toggleRails) {
+                                info.setRailsTo(conn.junctionName);
+                            }
+                        } else {
+                            Localization.PATHING_FAILED.broadcast(info.getGroup(), destination);
                         }
                     }
                 }
@@ -187,15 +190,8 @@ public class SignActionSwitcher extends SignAction {
     }
 
     @Override
-    public void destroy(SignActionEvent event) {
-        // Remove the switcher name (location toString) from the available node names
-        Block rails = event.getRails();
-        if (rails != null) {
-            PathNode node = PathNode.get(rails);
-            if (node != null) {
-                node.removeName(node.location.toString());
-            }
-        }
+    public boolean isRailSwitcher(SignActionEvent info) {
+        return true;
     }
 
     @Override

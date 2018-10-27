@@ -1,6 +1,6 @@
 package com.bergerkiller.bukkit.tc.statements;
 
-import com.bergerkiller.bukkit.tc.TrainCarts;
+import com.bergerkiller.bukkit.tc.TCConfig;
 import com.bergerkiller.bukkit.tc.controller.MinecartGroup;
 import com.bergerkiller.bukkit.tc.controller.MinecartMember;
 import com.bergerkiller.bukkit.tc.events.SignActionEvent;
@@ -65,7 +65,7 @@ public abstract class Statement {
      */
     public static boolean has(MinecartMember<?> member, MinecartGroup group, String text, SignActionEvent event) {
         boolean inv = false;
-        text = TrainCarts.statementShortcuts.replace(text);
+        text = TCConfig.statementShortcuts.replace(text);
         while (text.startsWith("!")) {
             text = text.substring(1);
             inv = !inv;
@@ -78,17 +78,17 @@ public abstract class Statement {
         String arrayText = idx == -1 ? null : lowerText.substring(0, idx);
         String[] array = idx == -1 ? null : parseArray(text.substring(idx + 1));
         for (Statement statement : statements) {
-            if (statement.match(lowerText)) {
-                if (member != null) {
-                    return statement.handle(member, text, event) != inv;
-                } else if (group != null) {
-                    return statement.handle(group, text, event) != inv;
-                }
-            } else if (arrayText != null && statement.matchArray(arrayText)) {
+            if (arrayText != null && statement.matchArray(arrayText)) {
                 if (member != null) {
                     return statement.handleArray(member, array, event) != inv;
                 } else if (group != null) {
                     return statement.handleArray(group, array, event) != inv;
+                }
+            } else if (statement.match(lowerText)) {
+                if (member != null) {
+                    return statement.handle(member, text, event) != inv;
+                } else if (group != null) {
+                    return statement.handle(group, text, event) != inv;
                 }
             }
         }

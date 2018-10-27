@@ -1,169 +1,169 @@
 package com.bergerkiller.bukkit.tc.controller.components;
 
+import org.bukkit.Location;
+import org.bukkit.block.Block;
+import org.bukkit.util.Vector;
+
 import com.bergerkiller.bukkit.common.bases.IntVector3;
-import com.bergerkiller.bukkit.common.entity.type.CommonMinecart;
 import com.bergerkiller.bukkit.tc.controller.MinecartMember;
 import com.bergerkiller.bukkit.tc.rails.logic.RailLogic;
-import com.bergerkiller.bukkit.tc.rails.logic.RailLogicGround;
-import com.bergerkiller.bukkit.tc.rails.logic.RailLogicVertical;
 import com.bergerkiller.bukkit.tc.rails.type.RailType;
-import com.bergerkiller.bukkit.tc.utils.TrackIterator;
-import org.bukkit.World;
-import org.bukkit.block.Block;
+import com.bergerkiller.bukkit.tc.utils.TrackWalkingPoint;
 
-/**
- * Stores rail information of a Minecart Member
- */
-public class RailTracker {
-    private final MinecartMember<?> owner;
-    public IntVector3 blockPos = new IntVector3(0, 0, 0);
-    private RailType lastRailType, railType;
-    private Block lastBlock, block;
-    private RailLogic lastRailLogic, railLogic;
-    private boolean railLogicSnapshotted = false;
-
-    public RailTracker(MinecartMember<?> owner) {
-        this.owner = owner;
-        this.lastRailType = this.railType = RailType.NONE;
-        this.lastRailLogic = this.railLogic = RailLogicGround.INSTANCE;
-    }
+public abstract class RailTracker {
 
     /**
-     * Refreshes the basic information with the information from the owner
+     * Checks whether the Minecart or Train drives on a particular rail block
+     * 
+     * @param railsBlock to check
+     * @return True if driving on that rails block, False if not
      */
-    public void onAttached() {
-        this.blockPos = owner.getEntity().loc.block();
-        this.lastBlock = this.block = this.blockPos.toBlock(owner.getEntity().getWorld());
-        this.refreshBlock();
-        this.lastBlock = this.block;
-        this.lastRailType = this.railType;
-        this.lastRailLogic = this.railLogic;
-    }
+    public abstract boolean isOnRails(Block railsBlock);
+
 
     /**
-     * Obtains a new track iterator iterating the tracks from this point towards the direction
-     * the Minecart is moving.
-     *
-     * @return forward track iterator
+     * Represents a single Rails block that is tracked by the Rail Tracker.
+     * Rail state information can be retrieved in relation to the minecarts on them.
      */
-    public TrackIterator getTrackIterator() {
-        return new TrackIterator(this.block, this.owner.getDirectionTo());
-    }
+    public static class TrackedRail {
+        /** The minecart that uses this rail */
+        public final MinecartMember<?> member;
+        /** Block position of the minecart on the rails */
+        public final Block minecartBlock;
+        /** Position of the rails (same as {@link #block}) */
+        public final IntVector3 position;
+        /** Block the rails is at */
+        public final Block block;
+        /** Type of rails */
+        public final RailType type;
+        /** Whether this rail is disconnected from the previous rails */
+        public final boolean disconnected;
+        /** Cached rail path taken on this rail */
+        public RailPath cachedPath = null;
+        /** State on the rail when this TrackedRail was created */
+        public final RailState state;
 
-    /**
-     * Gets the rail type of the current tick
-     *
-     * @return current rail type
-     */
-    public RailType getRailType() {
-        return railType;
-    }
-
-    /**
-     * Gets the rail type from the previous tick
-     *
-     * @return previous rail type
-     */
-    public RailType getLastRailType() {
-        return lastRailType;
-    }
-
-    /**
-     * Gets the block of the current tick
-     *
-     * @return current block
-     */
-    public Block getBlock() {
-        return block;
-    }
-
-    /**
-     * Gets the block from the previous tick
-     *
-     * @return previous block
-     */
-    public Block getLastBlock() {
-        return lastBlock;
-    }
-
-    /**
-     * Gets the rail logic of the current tick
-     *
-     * @return current rail logic
-     */
-    public RailLogic getRailLogic() {
-        if (railLogicSnapshotted) {
-            return this.railLogic;
-        } else {
-            return this.railType.getLogic(this.owner, this.block);
+        public TrackedRail(MinecartMember<?> member, TrackWalkingPoint point, boolean disconnected) {
+            this(member, point.state, disconnected);
         }
-    }
 
-    /**
-     * Gets the rail logic from the previous tick
-     *
-     * @return previous rail logic
-     */
-    public RailLogic getLastLogic() {
-        return lastRailLogic;
-    }
-
-    /**
-     * Checks whether the current rails block has changed
-     *
-     * @return True if the block changed, False if not
-     */
-    public boolean hasBlockChanged() {
-        return blockPos.x != lastBlock.getX() || blockPos.y != lastBlock.getY() || blockPos.z != lastBlock.getZ();
-    }
-
-    /**
-     * Stops using the Rail Logic snapshot for the next run
-     */
-    public void setLiveRailLogic() {
-        this.railLogicSnapshotted = false;
-    }
-
-    /**
-     * Creates a snapshot of the Rail Logic for the entire next run
-     */
-    public void snapshotRailLogic() {
-        this.railLogic = this.railType.getLogic(this.owner, this.block);
-        if (this.railLogic instanceof RailLogicVertical) {
-            this.railType = RailType.VERTICAL;
-        }
-        this.railLogicSnapshotted = true;
-    }
-
-    /**
-     * Refreshes the block using Minecart position information
-     */
-    public void refreshBlock() {
-        // Store the last rail information
-        this.lastBlock = this.block;
-        this.lastRailType = this.railType;
-        this.lastRailLogic = this.railLogic;
-
-        // Obtain the current, live block information
-        final CommonMinecart<?> entity = owner.getEntity();
-        final World world = entity.getWorld();
-        this.blockPos = entity.loc.block();
-
-        // Gather rail information
-        owner.vertToSlope = false;
-
-        // Find the rail - first step
-        this.railType = RailType.NONE;
-        for (RailType type : RailType.values()) {
-            IntVector3 pos = type.findRail(owner, world, this.blockPos);
-            if (pos != null) {
-                this.railType = type;
-                this.blockPos = pos;
-                break;
+        public TrackedRail(MinecartMember<?> member, RailState state, boolean disconnected) {
+            state.position().assertAbsolute();
+            this.member = member;
+            this.state = state.clone();
+            this.state.setMember(member);
+            this.minecartBlock = state.positionBlock();
+            this.type = state.railType();
+            this.block = state.railBlock();
+            this.disconnected = disconnected;
+            if (this.block == null) {
+                this.position = new IntVector3(0, 0, 0);
+            } else {
+                this.position = new IntVector3(this.block.getX(), this.block.getY(), this.block.getZ());
             }
         }
-        if (this.hasBlockChanged()) {
-            this.block = this.blockPos.toBlock(world);
+
+        public TrackedRail(MinecartMember<?> member, Location location, Block minecartBlock, Block railsBlock, RailType railsType, boolean disconnected) {
+            this.member = member;
+            this.state = new RailState();
+            this.state.setMember(member);
+            this.minecartBlock = minecartBlock;
+            this.block = railsBlock;
+            this.type = railsType;
+            this.disconnected = disconnected;
+            if (railsBlock == null) {
+                this.position = new IntVector3(0, 0, 0);
+            } else {
+                this.position = new IntVector3(railsBlock.getX(), railsBlock.getY(), railsBlock.getZ());
+            }
+            this.state.setRailBlock(railsBlock);
+            this.state.setRailType(railsType);
+            if (location != null) {
+                this.state.position().setLocation(location);
+            } else if (railsBlock != null) {
+                this.state.position().setLocationMidOf(railsBlock);
+            }
+            this.state.position().setMotion(new Vector(0, -1, 0));
+            this.state.initEnterDirection();
         }
+
+        /**
+         * Gets the world coordinates of the Minecart, null if no member is on this rail
+         * 
+         * @return member location
+         */
+        public Location getMemberLocation() {
+            return this.state.positionLocation();
+        }
+
+        /**
+         * Inverts the motion vector, making the path move in the exact opposite direction
+         * 
+         * @return tracked rail with inverted motion vector
+         */
+        public TrackedRail invertMotionVector() {
+            RailState state = this.state.clone();
+            RailPath.Position p = state.position();
+            p.motX = -p.motX;
+            p.motY = -p.motY;
+            p.motZ = -p.motZ;
+            state.initEnterDirection();
+            return new TrackedRail(member, state, this.disconnected);
+        }
+
+        /**
+         * Creates new rail information with a changed member owner
+         * 
+         * @param member to set to
+         * @return rail information with changed member
+         */
+        public TrackedRail changeMember(MinecartMember<?> member) {
+            return new TrackedRail(member, this.state, this.disconnected);
+        }
+
+        public RailLogic getLogic() {
+            return this.state.loadRailLogic();
+        }
+
+        public RailPath getPath() {
+            if (this.cachedPath == null) {
+                this.cachedPath = getLogic().getPath();
+            }
+            return this.cachedPath;
+        }
+
+        public boolean isSameTrack(TrackedRail other) {
+            return this.state.isSameRails(other.state) &&
+                   this.getPath().equals(other.getPath());
+        }
+
+        /**
+         * Computes Tracked Rail information for a Minecart that is off the rails
+         * 
+         * @param member
+         * @return detailed tracked rail information
+         */
+        public static TrackedRail createDerailed(MinecartMember<?> member) {
+            Location loc = member.getEntity().getLocation();
+            RailState state = new RailState();
+            state.position().setLocation(loc);
+            state.position().setMotion(member.getEntity().getVelocity());
+            state.setRailBlock(loc.getBlock());
+            state.setRailType(RailType.NONE);
+            state.initEnterDirection();
+            return new TrackedRail(member, state, false);
+        }
+
+        /**
+         * Evaluates the Minecart position information and creates Tracked rail information for it.
+         * 
+         * @param member to get the tracked rail information for
+         * @param disconnected whether the rail is disconnected from the previous
+         * @return tracked rail information for the member
+         */
+        public static TrackedRail create(MinecartMember<?> member, boolean disconnected) {
+            return new TrackedRail(member, member.discoverRail(), disconnected);
+        }
+
     }
 }

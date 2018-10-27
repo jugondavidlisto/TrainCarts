@@ -4,19 +4,35 @@ import com.bergerkiller.bukkit.common.utils.BlockUtil;
 import com.bergerkiller.bukkit.common.utils.FaceUtil;
 import com.bergerkiller.bukkit.common.utils.LogicUtil;
 import com.bergerkiller.bukkit.common.utils.MaterialUtil;
+import com.bergerkiller.bukkit.common.utils.MathUtil;
 import com.bergerkiller.bukkit.tc.Direction;
 import com.bergerkiller.bukkit.tc.PowerState;
-import com.bergerkiller.bukkit.tc.TrainCarts;
+import com.bergerkiller.bukkit.tc.SignActionHeader;
 import com.bergerkiller.bukkit.tc.Util;
+import com.bergerkiller.bukkit.tc.cache.RailSignCache;
 import com.bergerkiller.bukkit.tc.controller.MinecartGroup;
+import com.bergerkiller.bukkit.tc.controller.MinecartGroupStore;
 import com.bergerkiller.bukkit.tc.controller.MinecartMember;
 import com.bergerkiller.bukkit.tc.controller.MinecartMemberStore;
+import com.bergerkiller.bukkit.tc.controller.components.RailJunction;
+import com.bergerkiller.bukkit.tc.controller.components.RailPath;
+import com.bergerkiller.bukkit.tc.controller.components.RailState;
+import com.bergerkiller.bukkit.tc.controller.components.RailTracker.TrackedRail;
 import com.bergerkiller.bukkit.tc.properties.TrainProperties;
 import com.bergerkiller.bukkit.tc.rails.type.RailType;
 import com.bergerkiller.bukkit.tc.signactions.SignActionMode;
 import com.bergerkiller.bukkit.tc.signactions.SignActionType;
+import com.bergerkiller.bukkit.tc.utils.TrackWalkingPoint;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Locale;
+
 import org.bukkit.Location;
-import org.bukkit.Material;
 import org.bukkit.World;
 import org.bukkit.block.Block;
 import org.bukkit.block.BlockFace;
@@ -25,19 +41,15 @@ import org.bukkit.event.Cancellable;
 import org.bukkit.event.Event;
 import org.bukkit.event.HandlerList;
 import org.bukkit.material.Rails;
-
-import java.util.*;
+import org.bukkit.util.Vector;
 
 public class SignActionEvent extends Event implements Cancellable {
     private static final HandlerList handlers = new HandlerList();
     private final Block signblock;
-    private final SignActionMode mode;
-    private final BlockFace facing;
+    private BlockFace facing;
+    private final SignActionHeader header;
     private final Sign sign;
-    private final BlockFace[] watchedDirections;
-    private final boolean directionsDefined;
-    private final boolean powerinv;
-    private final boolean poweron;
+    private BlockFace[] watchedDirections;
     private Block railsblock;
     private SignActionType actionType;
     private BlockFace raildirection = null;
@@ -53,8 +65,32 @@ public class SignActionEvent extends Event implements Cancellable {
         this.memberchecked = true;
     }
 
+    public SignActionEvent(Block signblock, Block railsBlock, MinecartMember<?> member) {
+        this(signblock, railsBlock);
+        this.member = member;
+        this.memberchecked = true;
+    }
+
     public SignActionEvent(Block signblock, MinecartGroup group) {
         this(signblock);
+        this.group = group;
+        this.memberchecked = true;
+    }
+
+    public SignActionEvent(RailSignCache.TrackedSign trackedSign, MinecartMember<?> member) {
+        this(trackedSign);
+        this.member = member;
+        this.memberchecked = true;
+    }
+
+    public SignActionEvent(RailSignCache.TrackedSign trackedSign, MinecartGroup group) {
+        this(trackedSign);
+        this.group = group;
+        this.memberchecked = true;
+    }
+
+    public SignActionEvent(Block signblock, Block railsBlock, MinecartGroup group) {
+        this(signblock, railsBlock);
         this.group = group;
         this.memberchecked = true;
     }
@@ -67,86 +103,29 @@ public class SignActionEvent extends Event implements Cancellable {
         this(signblock, signblock == null ? null : BlockUtil.getSign(signblock), railsblock);
     }
 
+    public SignActionEvent(RailSignCache.TrackedSign trackedSign) {
+        this(trackedSign.signBlock, trackedSign.sign, trackedSign.railBlock);
+    }
+
     public SignActionEvent(final Block signblock, final Sign sign, Block railsblock) {
         this.signblock = signblock;
         this.sign = sign;
-        this.mode = SignActionMode.fromSign(this.sign);
         this.railsblock = railsblock;
         this.railschecked = this.railsblock != null;
-        String mainLine;
+        this.actionType = SignActionType.NONE;
+        this.facing = null;
         if (this.sign == null) {
             // No sign available - set default values and abort
-            this.powerinv = false;
-            this.poweron = false;
-            this.facing = null;
+            this.header = SignActionHeader.parse(null);
             this.watchedDirections = FaceUtil.AXIS;
-            this.directionsDefined = false;
-            return;
         } else {
             // Sign available - initialize the sign
-            if (TrainCarts.parseOldSigns) {
-                convertFirstLine();
+            this.header = SignActionHeader.parseFromEvent(this);
+            if (this.header.isLegacyConverted() && this.header.isValid()) {
+                this.setLine(0, this.header.toString());
             }
-            mainLine = this.getLine(0);
-            this.poweron = mainLine.startsWith("[+");
-            this.powerinv = mainLine.startsWith("[!");
-            this.facing = BlockUtil.getFacing(this.signblock);
+            this.watchedDirections = null;
         }
-        HashSet<BlockFace> watchedFaces = new HashSet<>(4);
-        // Find out what directions are watched by this sign
-        int idx = mainLine.indexOf(':');
-        this.directionsDefined = (idx != -1);
-        if (!this.directionsDefined) {
-            // find out using the rails above and sign facing
-            if (this.hasRails()) {
-                if (FaceUtil.isVertical(this.getRailDirection())) {
-                    watchedFaces.add(BlockFace.UP);
-                    watchedFaces.add(BlockFace.DOWN);
-                } else {
-                    Rails rails = BlockUtil.getRails(this.getRails());
-                    if (rails != null && rails.isOnSlope() && Util.isVerticalAbove(this.getRails(), rails.getDirection())) {
-                        watchedFaces.add(BlockFace.UP);
-                        watchedFaces.add(rails.getDirection().getOppositeFace());
-                    } else if (FaceUtil.isSubCardinal(this.getFacing())) {
-                        // More advanced corner checks - NE/SE/SW/NW
-                        // Use rail directions validated against sign facing to
-                        // find out what directions are watched
-                        BlockFace[] faces = FaceUtil.getFaces(this.getFacing());
-                        for (BlockFace face : faces) {
-                            if (this.isConnectedRails(face)) {
-                                watchedFaces.add(face.getOppositeFace());
-                            }
-                        }
-                        // Try an inversed version, maybe rails can be found there
-                        if (watchedFaces.isEmpty()) {
-                            for (BlockFace face : faces) {
-                                if (this.isConnectedRails(face.getOppositeFace())) {
-                                    watchedFaces.add(face);
-                                }
-                            }
-                        }
-                    } else {
-                        // Simple facing checks - NESW
-                        if (this.isConnectedRails(facing)) {
-                            watchedFaces.add(facing.getOppositeFace());
-                        } else if (this.isConnectedRails(facing.getOppositeFace())) {
-                            watchedFaces.add(facing);
-                        } else {
-                            watchedFaces.add(FaceUtil.rotate(facing, -2));
-                            watchedFaces.add(FaceUtil.rotate(facing, 2));
-                        }
-                    }
-                }
-            }
-        } else if (mainLine.endsWith("]")) {
-            String text = mainLine.substring(idx + 1, mainLine.length() - 1);
-            watchedFaces.addAll(Arrays.asList(Direction.parseAll(text, this.getFacing().getOppositeFace())));
-        }
-        // Apply watched faces
-        if (watchedFaces.isEmpty()) {
-            watchedFaces.add(this.getFacing().getOppositeFace());
-        }
-        this.watchedDirections = watchedFaces.toArray(new BlockFace[0]);
     }
 
     public static HandlerList getHandlerList() {
@@ -163,71 +142,310 @@ public class SignActionEvent extends Event implements Cancellable {
     }
 
     /**
+     * Gets the direction vector of the cart upon entering the rails
+     * that triggered this sign. If no cart exists, it defaults to the activating direction
+     * of the sign (facing or watched directions).
+     * 
+     * @return enter direction vector
+     */
+    public Vector getCartEnterDirection() {
+        if (this.hasMember()) {
+            // Find the rails block matching the one that triggered this event
+            // Return the enter ('from') direction for that rails block if found
+            if (this.hasRails()) {
+                Block rails = this.getRails();
+                for (TrackedRail rail : this.member.getGroup().getRailTracker().getRailInformation()) {
+                    if (rail.member == this.member && rail.block.equals(rails)) {
+                        return rail.state.enterDirection();
+                    }
+                }
+            }
+
+            // Ask the minecart itself alternatively
+            return this.member.getEntity().getVelocity();
+        }
+
+        // Find the facing direction from watched directions, or sign orientation
+        BlockFace signDirection;
+        if (this.getWatchedDirections().length > 0) {
+            signDirection = this.getWatchedDirections()[0];
+        } else {
+            signDirection = this.getFacing().getOppositeFace();
+        }
+
+        // Snap sign direction to the rails, if a rails exists
+        if (this.hasRails()) {
+            RailState state = new RailState();
+            state.setRailBlock(this.getRails());
+            state.setRailType(RailType.getType(state.railBlock()));
+            state.position().setLocation(state.railType().getSpawnLocation(state.railBlock(), signDirection));
+            state.position().setMotion(signDirection);
+            state.loadRailLogic().getPath().snap(state.position(), state.railBlock());
+            return state.position().getMotion();
+        }
+
+        return FaceUtil.faceToVector(signDirection);
+    }
+
+    /**
      * Gets the direction a minecart has above the rails of this Sign
      *
      * @return cart direction
      */
     public BlockFace getCartDirection() {
         if (this.hasMember()) {
+            // Find the rails block matching the one that triggered this event
+            // Return the enter ('from') direction for that rails block if found
+            if (this.hasRails()) {
+                Block rails = this.getRails();
+                for (TrackedRail rail : this.member.getGroup().getRailTracker().getRailInformation()) {
+                    if (rail.member == this.member && rail.block.equals(rails)) {
+                        return rail.state.enterFace();
+                    }
+                }
+            }
+
+            // Ask the minecart itself alternatively
             return this.member.getDirectionFrom();
         }
         if (this.hasRails()) {
             return FaceUtil.getFaces(this.getRailDirection())[0];
         }
-        if (this.watchedDirections.length > 0) {
-            return this.watchedDirections[0];
+        if (this.getWatchedDirections().length > 0) {
+            return this.getWatchedDirections()[0];
         }
         return this.getFacing().getOppositeFace();
     }
 
+    /* ============================= Deprecated BlockFace Junctions =============================== */
+
     /**
      * Sets the rails above this sign to connect with the from and to directions<br>
-     * If the cart has to be reversed, that is done
+     * If the cart has to be reversed, that is done<br>
+     * <br>
+     * <b>Deprecated: no longer limited to BlockFace directions, use junctions instead</b>
      *
      * @param from direction
      * @param to   direction
      */
+    @Deprecated
     public void setRailsFromTo(BlockFace from, BlockFace to) {
-        if (this.hasRails()) {
-            if (from == to) {
-                // Try to find out a better from direction
-                for (BlockFace face : FaceUtil.getFaces(this.getRailDirection())) {
-                    if (face != to) {
-                        from = face;
-                        break;
-                    }
-                }
-            }
-            BlockUtil.setRails(this.getRails(), from, to);
-            if (this.hasMember() && this.member.getDirectionFrom().getOppositeFace() == to) {
-                // Break this cart from the train if needed
-                this.member.getGroup().split(this.member.getIndex());
-                // Launch in the other direction
-                double force = this.member.getForce();
-                this.getGroup().stop();
-                this.getGroup().getActions().clear();
-                this.member.getActions().addActionLaunch(to, 1, force);
-            }
-        }
+        setRailsFromTo(findJunction(from), findJunction(to));
     }
 
     /**
-     * Sets the rails above this sign to lead from the minecart direction to the direction specified
+     * Sets the rails above this sign to lead from the minecart direction to the direction specified<br>
+     * <br>
+     * <b>Deprecated: no longer limited to BlockFace directions, use junctions instead</b>
      *
      * @param to direction
      */
+    @Deprecated
     public void setRailsTo(BlockFace to) {
-        setRailsFromTo(getCartDirection().getOppositeFace(), to);
+        setRailsTo(findJunction(to));
     }
 
     /**
      * Sets the rails above this sign to lead from the minecart direction into a direction specified<br>
-     * Relative directions, like left and right, are relative to the sign direction
+     * Relative directions, like left and right, are relative to the sign direction<br>
+     * <br>
+     * <b>Deprecated: no longer limited to BlockFace directions, use junctions instead</b>
      *
      * @param direction to set the rails to
      */
+    @Deprecated
     public void setRailsTo(Direction direction) {
-        this.setRailsTo(direction.getDirection(this.getFacing()));
+        setRailsTo(findJunction(direction));
+    }
+
+    /* ===================================================================================== */
+
+    /**
+     * Gets a list of valid junctions that can be taken on the rails block of this sign
+     * 
+     * @return junctions
+     */
+    public List<RailJunction> getJunctions() {
+        return RailType.getType(this.getRails()).getJunctions(this.getRails());
+    }
+
+    /**
+     * Attempts to find a junction of the rails block belonging to this sign event by name
+     * 
+     * @param junctionName
+     * @return junction, null if not found
+     */
+    public RailJunction findJunction(String junctionName) {
+        // Match the junction by name exactly
+        for (RailJunction junc : getJunctions()) {
+            if (junc.name().equals(junctionName)) {
+                return junc;
+            }
+        }
+
+        // Attempt parsing the junctionName into a Direction statement
+        // This includes special handling for continue/reverse, which uses cart direction
+        final String dirText = junctionName.toLowerCase(Locale.ENGLISH);
+        if (LogicUtil.contains(dirText, "c", "continue")) {
+            return findJunction(Direction.fromFace(this.getCartDirection()));
+        } else if (LogicUtil.contains(dirText, "i", "rev", "reverse", "inverse")) {
+            return findJunction(Direction.fromFace(this.getCartDirection().getOppositeFace()));
+        } else {
+            return findJunction(Direction.parse(dirText));
+        }
+    }
+
+    /**
+     * Attempts to find a junction of the rails block belonging to this sign event by face direction
+     * 
+     * @param face
+     * @return junction, null if not found
+     */
+    public RailJunction findJunction(BlockFace face) {
+        return Util.faceToJunction(getJunctions(), face);
+    }
+
+    /**
+     * Attempts to find a junction of the rails block belonging to this sign event by a
+     * Direction statement. This also handles logic such as sign-relative left, right and forward.
+     * 
+     * @param direction
+     * @return junction, null if not found
+     */
+    public RailJunction findJunction(Direction direction) {
+        if (direction == Direction.NONE || direction == null) {
+            return null;
+        }
+        BlockFace to = direction.getDirection(this.getFacing());
+        if (direction == Direction.LEFT || direction == Direction.RIGHT) {
+            if (!this.isConnectedRails(to)) {
+                to = Direction.FORWARD.getDirection(this.getFacing());
+            }
+        }
+        return findJunction(to);
+    }
+
+    /**
+     * Gets the rail junction from which the rails of this sign were entered.
+     * This is used when switching rails to select the 'from' junction.
+     * 
+     * @return rail junction
+     */
+    public RailJunction getEnterJunction() {
+        if (this.hasMember()) {
+            // Find the rails block matching the one that triggered this event
+            // Return the enter ('from') direction for that rails block if found
+            TrackedRail memberRail = null;
+            if (this.hasRails()) {
+                Block rails = this.getRails();
+                for (TrackedRail rail : this.member.getGroup().getRailTracker().getRailInformation()) {
+                    if (rail.member == this.member && rail.block.equals(rails)) {
+                        memberRail = rail;
+                        break;
+                    }
+                }
+            }
+
+            // Ask the minecart itself alternatively
+            if (memberRail == null) {
+                memberRail = this.member.getRailTracker().getRail();
+            }
+
+            // Compute the position at the start of the rail's path by walking 'back'
+            RailPath.Position pos = memberRail.state.position().clone();
+            pos.invertMotion();
+            memberRail.getPath().move(pos, memberRail.block, Double.MAX_VALUE);
+
+            // Find the junction closest to this start position
+            double min_dist = Double.MAX_VALUE;
+            RailJunction best_junc = null;
+            for (RailJunction junc : memberRail.type.getJunctions(memberRail.block)) {
+                if (junc.position().relative) {
+                    pos.makeRelative(memberRail.block);
+                } else {
+                    pos.makeAbsolute(memberRail.block);
+                }
+                double dist_sq = junc.position().distanceSquared(pos);
+                if (dist_sq < min_dist) {
+                    min_dist = dist_sq;
+                    best_junc = junc;
+                }
+            }
+            return best_junc;
+        }
+
+        //TODO: Do we NEED a fallback?
+        return null;
+    }
+
+    public void setRailsTo(String toJunctionName) {
+        setRailsFromTo(getEnterJunction(), findJunction(toJunctionName));
+    }
+
+    public void setRailsTo(RailJunction toJunction) {
+        setRailsFromTo(getEnterJunction(), toJunction);
+    }
+
+    public void setRailsFromTo(RailJunction fromJunction, String toJunctionName) {
+        setRailsFromTo(fromJunction, findJunction(toJunctionName));
+    }
+
+    public void setRailsFromTo(RailJunction fromJunction, RailJunction toJunction) {
+        if (!this.hasRails() || fromJunction == null || toJunction == null) {
+            return;
+        }
+
+        MinecartGroupStore.notifyPhysicsChange();
+
+        Block railBlock = this.getRails();
+        RailType railType = RailType.getType(railBlock);
+
+        // If from and to are the same, the train is launched back towards where it came
+        // In this special case, select another junction part of the path as the from
+        // and launch the train backwards
+        if (fromJunction.name().equals(toJunction.name())) {
+            // Pick any other junction that is not equal to 'to'
+            // Prefer junctions that have already been selected (assert from rail path)
+            RailState state = RailState.getSpawnState(railType, railBlock);
+            RailPath path = state.loadRailLogic().getPath();
+            RailPath.Position p0 = path.getStartPosition();
+            RailPath.Position p1 = path.getEndPosition();
+            double min_dist = Double.MAX_VALUE;
+            for (RailJunction junc : railType.getJunctions(railBlock)) {
+                if (junc.name().equals(fromJunction.name())) {
+                    continue;
+                }
+                if (junc.position().relative) {
+                    p0.makeRelative(railBlock);
+                    p1.makeRelative(railBlock);
+                } else {
+                    p0.makeAbsolute(railBlock);
+                    p1.makeAbsolute(railBlock);
+                }
+                double dist_sq = Math.min(p0.distanceSquared(junc.position()),
+                                          p1.distanceSquared(junc.position()));
+                if (dist_sq < min_dist) {
+                    min_dist = dist_sq;
+                    fromJunction = junc;
+                }
+            }
+
+            // Switch it
+            railType.switchJunction(this.getRails(), fromJunction, toJunction);
+
+            // Launch train into the opposite direction, if required
+            if (this.hasMember()) {
+                // Break this cart from the train if needed
+                this.member.getGroup().split(this.member.getIndex());
+                this.member.getGroup().getActions().clear();
+                this.member.getGroup().reverse();
+            }
+
+            return;
+        }
+
+        // Normal switching. Nothing special here.
+        railType.switchJunction(this.getRails(), fromJunction, toJunction);
     }
 
     /**
@@ -270,21 +488,37 @@ public class SignActionEvent extends Event implements Cancellable {
     }
 
     /**
-     * Checks whether power reading is inverted for this Sign
-     *
-     * @return True if it is inverted, False if not
+     * Obtains the header of this sign containing relevant properties that are contained
+     * on the first line of a TrainCarts sign.
+     * 
+     * @return sign header
      */
-    public boolean isPowerInverted() {
-        return this.powerinv;
+    public SignActionHeader getHeader() {
+        return this.header;
     }
 
     /**
-     * Checks whether power reading always returns on for this Sign
+     * Checks whether power reading is inverted for this Sign<br>
+     * <br>
+     * <b>Deprecated:</b> use the properties in {@link #getHeader()} instead
+     *
+     * @return True if it is inverted, False if not
+     */
+    @Deprecated
+    public boolean isPowerInverted() {
+        return getHeader().isInverted();
+    }
+
+    /**
+     * Checks whether power reading always returns on for this Sign<br>
+     * <br>
+     * <b>Deprecated:</b> use {@link #isPowerMode(mode)} instead
      *
      * @return True if the power is always on, False if not
      */
+    @Deprecated
     public boolean isPowerAlwaysOn() {
-        return this.poweron;
+        return getHeader().isAlwaysOn();
     }
 
     public PowerState getPower(BlockFace from) {
@@ -292,60 +526,48 @@ public class SignActionEvent extends Event implements Cancellable {
     }
 
     public boolean isPowered(BlockFace from) {
-        return this.poweron || this.powerinv != this.getPower(from).hasPower();
-    }
-
-    public boolean isPowered() {
-        return this.poweron || this.isPoweredRaw(this.powerinv);
+        if (this.header.isAlwaysOff()) {
+            return false;
+        }
+        return this.header.isAlwaysOn() || this.header.isInverted() != this.getPower(from).hasPower();
     }
 
     /**
-     * Checks if this sign is powered, ignoring settings on the sign
+     * Gets whether this Sign is powered according to the sign rules.
+     * <ul>
+     * <li>If this is a REDSTONE_ON event, true is returned</li>
+     * <li>If this is a REDSTONE_OFF event, false is returned</li>
+     * <li>If the sign header indicates always-on, true is returned all the time</li>
+     * <li>If the sign header indicates power inversion, true is returned when no Redstone power exists</li>
+     * <li>For other cases (default), true is returned when Redstone power exists to this sign</li>
+     * </ul>
+     * 
+     * @return True if the sign is powered, False if not
+     */
+    public boolean isPowered() {
+        if (this.header.isAlwaysOff()) {
+            return false;
+        }
+        if (this.actionType == SignActionType.REDSTONE_ON) {
+            return true;
+        }
+        if (this.actionType == SignActionType.REDSTONE_OFF) {
+            return false;
+        }
+        return this.header.isAlwaysOn() || this.isPoweredRaw(this.header.isInverted());
+    }
+
+    /**
+     * Checks if this sign is powered, ignoring settings on the sign.<br>
+     * <br>
+     * <b>Deprecated:</b> Use {@link PowerState#isSignPowered(signBlock, inverted)} instead
      *
      * @param invert True to invert the power as a result, False to get the normal result
      * @return True if powered when not inverted, or not powered and inverted
      */
+    @Deprecated
     public boolean isPoweredRaw(boolean invert) {
-        BlockFace att = BlockUtil.getAttachedFace(this.signblock);
-        Block attblock = this.signblock.getRelative(att);
-        if (attblock.isBlockPowered()) {
-            boolean found = false;
-            for (BlockFace face : FaceUtil.ATTACHEDFACES) {
-                if (BlockUtil.isType(attblock.getRelative(face), Material.LEVER)) {
-                    //check EVERYTHING
-                    for (BlockFace alter : FaceUtil.ATTACHEDFACESDOWN) {
-                        if (alter != face) {
-                            if (PowerState.get(attblock, alter, false) == PowerState.ON) {
-                                return !invert;
-                            }
-                        }
-                    }
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) return !invert;
-        }
-        if (invert) {
-            for (BlockFace face : FaceUtil.ATTACHEDFACESDOWN) {
-                if (face == att) continue;
-                PowerState state = this.getPower(face);
-                switch (state) {
-                    case NONE:
-                        continue;
-                    case ON:
-                        return false; //def = false; continue;
-                    case OFF:
-                }
-            }
-            return true;
-        } else {
-            for (BlockFace face : FaceUtil.ATTACHEDFACESDOWN) {
-                if (face == att) continue;
-                if (this.getPower(face).hasPower()) return true;
-            }
-            return false;
-        }
+        return PowerState.isSignPowered(this.signblock, invert);
     }
 
     public boolean isPoweredFacing() {
@@ -392,7 +614,7 @@ public class SignActionEvent extends Event implements Cancellable {
     public Location getCenterLocation() {
         if (!this.hasRails()) return null;
         RailType type = RailType.getType(this.railsblock);
-        return type.findMinecartPos(this.railsblock).getLocation().add(0.5, 0.5, 0.5);
+        return type.getSpawnLocation(this.railsblock, this.getFacing());
     }
 
     /**
@@ -410,6 +632,9 @@ public class SignActionEvent extends Event implements Cancellable {
     }
 
     public BlockFace getFacing() {
+        if (this.facing == null) {
+            this.facing = BlockUtil.getFacing(this.signblock);
+        }
         return this.facing;
     }
 
@@ -426,8 +651,7 @@ public class SignActionEvent extends Event implements Cancellable {
         if (!member.isMoving()) {
             return true;
         }
-        final BlockFace dir = this.isAction(SignActionType.MEMBER_MOVE) ? member.getDirectionTo() : member.getDirectionFrom();
-        return this.isWatchedDirection(dir);
+        return this.isWatchedDirection(this.getCartEnterDirection());
     }
 
     /**
@@ -468,23 +692,32 @@ public class SignActionEvent extends Event implements Cancellable {
         if (!this.hasRails()) {
             return false;
         }
-        // Get the next minecart Block position
+
+        // Move from the current rail minecart position one block into the direction
+        // Check if a rail exists there. If there is, check if it points at this rail
+        // If so, then there is a rails there!
         RailType currentType = RailType.getType(getRails());
-        if (!LogicUtil.contains(direction, currentType.getPossibleDirections(getRails()))) {
+        RailJunction junction = Util.faceToJunction(currentType.getJunctions(getRails()), direction);
+        if (junction == null) {
             return false;
         }
-        Block posBlock = currentType.getNextPos(getRails(), direction);
-        if (posBlock == null) {
+        RailState state = currentType.takeJunction(getRails(), junction);
+        if (state == null) {
             return false;
         }
-        for (RailType type : RailType.values()) {
-            Block railsBlock = type.findRail(posBlock);
-            if (railsBlock != null) {
-                // Check that the next block allows a connection with this Block
-                return LogicUtil.contains(direction.getOppositeFace(), type.getPossibleDirections(railsBlock));
-            }
+
+        // Move backwards again from the rails found
+        state.setMotionVector(state.motionVector().multiply(-1.0));
+        state.initEnterDirection();
+        TrackWalkingPoint wp = new TrackWalkingPoint(state);
+        wp.skipFirst();
+        if (!wp.moveFull()) {
+            return false;
         }
-        return false;
+
+        // Verify this is the Block we came from
+        return wp.state.railType() == currentType &&
+               wp.state.railBlock().equals(getRails());
     }
 
     /**
@@ -539,7 +772,7 @@ public class SignActionEvent extends Event implements Cancellable {
                 } else {
                     // Get the Minecart in the group that contains this sign
                     for (MinecartMember<?> member : this.group) {
-                        if (member.getBlockTracker().containsSign(this.signblock)) {
+                        if (member.getSignTracker().containsSign(this.signblock)) {
                             this.member = member;
                             break;
                         }
@@ -585,7 +818,7 @@ public class SignActionEvent extends Event implements Cancellable {
      * @return True if defined, False if not
      */
     public boolean isWatchedDirectionsDefined() {
-        return this.directionsDefined;
+        return this.getHeader().hasDirections();
     }
 
     /**
@@ -594,17 +827,106 @@ public class SignActionEvent extends Event implements Cancellable {
      * @return Watched directions
      */
     public BlockFace[] getWatchedDirections() {
+        // Lazy initialization here
+        if (this.watchedDirections == null) {
+            HashSet<BlockFace> watchedFaces = new HashSet<>(4);
+            // Find out what directions are watched by this sign
+            if (!this.header.hasDirections()) {
+                // find out using the rails above and sign facing
+                if (this.hasRails()) {
+                    if (FaceUtil.isVertical(this.getRailDirection())) {
+                        watchedFaces.add(BlockFace.UP);
+                        watchedFaces.add(BlockFace.DOWN);
+                    } else {
+                        if (FaceUtil.isSubCardinal(this.getFacing())) {
+                            // More advanced corner checks - NE/SE/SW/NW
+                            // Use rail directions validated against sign facing to
+                            // find out what directions are watched
+                            BlockFace[] faces = FaceUtil.getFaces(this.getFacing());
+                            for (BlockFace face : faces) {
+                                if (this.isConnectedRails(face)) {
+                                    watchedFaces.add(face.getOppositeFace());
+                                }
+                            }
+                            // Try an inversed version, maybe rails can be found there
+                            if (watchedFaces.isEmpty()) {
+                                for (BlockFace face : faces) {
+                                    if (this.isConnectedRails(face.getOppositeFace())) {
+                                        watchedFaces.add(face);
+                                    }
+                                }
+                            }
+                        } else {
+                            // Sloped rails also include UP/DOWN, handling from/to vertical rail movement
+                            Rails rails = BlockUtil.getRails(this.getRails());
+                            if (rails != null && rails.isOnSlope()) {
+                                watchedFaces.add(BlockFace.UP);
+                                watchedFaces.add(BlockFace.DOWN);
+                            }
+
+                            // Simple facing checks - NESW
+                            BlockFace facing = this.getFacing();
+                            if (this.isConnectedRails(facing)) {
+                                watchedFaces.add(facing.getOppositeFace());
+                            } else if (this.isConnectedRails(facing.getOppositeFace())) {
+                                watchedFaces.add(facing);
+                            } else {
+                                watchedFaces.add(FaceUtil.rotate(facing, -2));
+                                watchedFaces.add(FaceUtil.rotate(facing, 2));
+                            }
+                        }
+                    }
+                }
+            } else {
+                watchedFaces.addAll(Arrays.asList(this.header.getFaces(this.getFacing().getOppositeFace())));
+            }
+            // Apply watched faces
+            if (watchedFaces.isEmpty()) {
+                watchedFaces.add(this.getFacing().getOppositeFace());
+            }
+            this.watchedDirections = watchedFaces.toArray(new BlockFace[0]);
+        }
         return this.watchedDirections;
     }
 
     /**
-     * Checks if a given direction is watched by this sign
+     * Gets an array of possible directions in which spawner and teleporter signs can lay down trains
+     * 
+     * @return spawn directions
+     */
+    public BlockFace[] getSpawnDirections() {
+        BlockFace[] spawndirs = new BlockFace[this.getWatchedDirections().length];
+        for (int i = 0; i < spawndirs.length; i++) {
+            spawndirs[i] = this.getWatchedDirections()[i].getOppositeFace();
+        }
+        return spawndirs;
+    }
+
+    /**
+     * Checks if a given BlockFace direction is watched by this sign
      *
      * @param direction to check
      * @return True if watched, False otherwise
      */
+    @Deprecated
     public boolean isWatchedDirection(BlockFace direction) {
-        return LogicUtil.contains(direction, this.watchedDirections);
+        return LogicUtil.contains(direction, this.getWatchedDirections());
+    }
+
+    /**
+     * Checks if a given movement direction is watched by this sign.
+     * When this returns true, the sign should be activated.
+     * 
+     * @param direction to check
+     * @return True if watched, False otherwise
+     */
+    public boolean isWatchedDirection(Vector direction) {
+        for (BlockFace watched : this.getWatchedDirections()) {
+            if (MathUtil.isHeadingTo(watched, direction)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -650,24 +972,12 @@ public class SignActionEvent extends Event implements Cancellable {
         return Collections.EMPTY_LIST;
     }
 
-    /*
-     * Add [] around first line, if [] are not present and first line
-     * looks like a valid TrainCarts sign.
-     */
-    public void convertFirstLine() {
-        String firstLineOriginal = this.sign.getLine(0);
-        String firstLineConverted = SignActionMode.convertOldSignString(firstLineOriginal);
-        if (! firstLineOriginal.equals(firstLineConverted)) {
-            this.setLine(0, firstLineConverted);
-        }
-    }
-
     public String getLine(int index) {
-        return this.sign.getLine(index);
+        return Util.getCleanLine(this.sign, index);
     }
 
     public String[] getLines() {
-        return this.sign.getLines();
+        return Util.cleanSignLines(this.sign.getLines());
     }
 
     public void setLine(int index, String line) {
@@ -677,23 +987,23 @@ public class SignActionEvent extends Event implements Cancellable {
 
     /**
      * Gets the sign mode of this TrainCarts sign
-     *
+     * 
      * @return Sign mode
      */
     public SignActionMode getMode() {
-        return this.mode;
+        return this.getHeader().getMode();
     }
 
     public boolean isCartSign() {
-        return this.mode == SignActionMode.CART;
+        return this.getHeader().isCart();
     }
 
     public boolean isTrainSign() {
-        return this.mode == SignActionMode.TRAIN;
+        return this.getHeader().isTrain();
     }
 
     public boolean isRCSign() {
-        return this.mode == SignActionMode.RCTRAIN;
+        return this.getHeader().isRC();
     }
 
     /**
@@ -704,7 +1014,7 @@ public class SignActionEvent extends Event implements Cancellable {
      * @return True if the line starts with any of the specified types, False if not
      */
     public boolean isLine(int line, String... texttypes) {
-        String linetext = this.getLine(line).toLowerCase();
+        String linetext = this.getLine(line).toLowerCase(Locale.ENGLISH);
         for (String type : texttypes) {
             if (linetext.startsWith(type)) return true;
         }
@@ -718,7 +1028,31 @@ public class SignActionEvent extends Event implements Cancellable {
      * @return True if the first line starts with any of the types AND the sign has a valid mode, False if not
      */
     public boolean isType(String... signtypes) {
-        return (this.mode != SignActionMode.NONE) && isLine(1, signtypes);
+        return getHeader().isValid() && isLine(1, signtypes);
+    }
+
+    @Override
+    public String toString() {
+        String text = "{ block=[" + signblock.getX() + "," + signblock.getY() + "," + signblock.getZ() + "]";
+        text += ", action=" + this.actionType;
+        text += ", watched=[";
+        for (int i = 0; i < this.getWatchedDirections().length; i++) {
+            if (i > 0) text += ",";
+            text += this.getWatchedDirections()[i].name();
+        }
+        text += "]";
+        if (this.sign == null) {
+            text += " }";
+        } else {
+            text += ", lines=";
+            String[] lines = this.getLines();
+            for (int i = 0; i < lines.length; i++) {
+                if (i > 0 && lines[i].length() > 0) text += " ";
+                text += lines[i];
+            }
+            text += " }";
+        }
+        return text;
     }
 
     @Override

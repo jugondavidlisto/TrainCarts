@@ -21,6 +21,27 @@ public class ActionTrackerGroup extends ActionTracker {
     }
 
     @Override
+    public void doTick() {
+        super.doTick();
+        for (MinecartMember<?> member : this.owner) {
+            member.getActions().doTick();
+        }
+    }
+
+    /**
+     * Clears all set actions ( {@link #clear()} ) while preserving launch speed of existing actions.
+     * This is a workaround to allow multiple activated actions in a single tick to function.
+     */
+    public void launchReset() {
+        Action action = this.getCurrentAction();
+        if (action instanceof MemberActionLaunch && action.elapsedTicks() == 0) {
+            MemberActionLaunch launchAction = (MemberActionLaunch) action;
+            this.getOwner().setForwardForce(launchAction.getTargetVelocity());
+        }
+        this.clear();
+    }
+
+    @Override
     public void clear() {
         super.clear();
         for (MinecartMember<?> member : owner) {

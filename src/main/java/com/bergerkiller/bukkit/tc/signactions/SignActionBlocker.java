@@ -5,6 +5,7 @@ import com.bergerkiller.bukkit.common.utils.ParseUtil;
 import com.bergerkiller.bukkit.tc.Direction;
 import com.bergerkiller.bukkit.tc.Permission;
 import com.bergerkiller.bukkit.tc.actions.GroupActionWaitState;
+import com.bergerkiller.bukkit.tc.controller.components.RailState;
 import com.bergerkiller.bukkit.tc.events.SignActionEvent;
 import com.bergerkiller.bukkit.tc.events.SignChangeActionEvent;
 import org.bukkit.block.BlockFace;
@@ -19,13 +20,13 @@ public class SignActionBlocker extends SignAction {
     @Override
     public void execute(SignActionEvent info) {
         if (info.getMode() != SignActionMode.NONE && info.hasRailedMember()) {
-            if (info.isAction(SignActionType.GROUP_LEAVE) || (info.isAction(SignActionType.REDSTONE_CHANGE) && !info.isPowered())) {
+            if (info.isAction(SignActionType.GROUP_LEAVE) || info.isAction(SignActionType.REDSTONE_OFF)) {
                 // Remove the wait state when the train leaves or the sign lost power to block
                 GroupActionWaitState action = CommonUtil.tryCast(info.getGroup().getActions().getCurrentAction(), GroupActionWaitState.class);
                 if (action != null) {
                     action.stop();
                 }
-            } else if (info.isPowered() && info.isAction(SignActionType.GROUP_ENTER, SignActionType.REDSTONE_CHANGE, SignActionType.MEMBER_MOVE)) {
+            } else if (info.isPowered() && info.isAction(SignActionType.GROUP_ENTER, SignActionType.REDSTONE_ON, SignActionType.MEMBER_MOVE)) {
                 // Set the next direction based on the sign
                 // Don't do this in the move event as that one fires too often (performance issue)
                 if (!info.isAction(SignActionType.MEMBER_MOVE)) {
@@ -48,7 +49,17 @@ public class SignActionBlocker extends SignAction {
     }
 
     @Override
+    public boolean isMemberMoveHandled(SignActionEvent info) {
+        return true;
+    }
+
+    @Override
+    public boolean isPathFindingBlocked(SignActionEvent info, RailState state) {
+        return info.isPowerAlwaysOn() && info.isWatchedDirection(state.enterDirection());
+    }
+
+    @Override
     public boolean build(SignChangeActionEvent event) {
-        return event.getMode() != SignActionMode.NONE && handleBuild(event, Permission.BUILD_BLOCKER, "train blocker", "block trains coming from a certain direction");
+        return handleBuild(event, Permission.BUILD_BLOCKER, "train blocker", "block trains coming from a certain direction");
     }
 }

@@ -32,21 +32,15 @@ public class ArrivalSigns {
     }
 
     public static boolean isTrigger(Sign sign) {
-        if (sign != null) {
-            if (sign.getLine(0).equalsIgnoreCase("[train]")) {
-                if (sign.getLine(1).equalsIgnoreCase("trigger")) {
-                    return true;
-                }
-            }
-        }
-        return false;
+        SignActionHeader header = SignActionHeader.parseFromSign(sign);
+        return header.isValid() && Util.getCleanLine(sign, 1).equalsIgnoreCase("trigger");
     }
 
     public static void trigger(Sign sign, MinecartMember<?> mm) {
-        if (!TrainCarts.SignLinkEnabled) return;
-        String name = sign.getLine(2);
-        String duration = sign.getLine(3);
-        if (name == null || name.equals("")) return;
+        if (!TCConfig.SignLinkEnabled) return;
+        String name = Util.getCleanLine(sign, 2);
+        String duration = Util.getCleanLine(sign, 3);
+        if (name.isEmpty()) return;
         if (mm != null) {
             Variables.get(name + 'N').set(mm.getGroup().getProperties().getDisplayName());
             if (mm.getProperties().hasDestination()) {
@@ -54,7 +48,10 @@ public class ArrivalSigns {
             } else {
                 Variables.get(name + 'D').set("Unknown");
             }
-            Variables.get(name + 'V').set(Double.toString(MathUtil.round(mm.getForce(), 2)));
+
+            double speed = MathUtil.round(mm.getRealSpeed(), 2);
+            speed = Math.min(speed, mm.getGroup().getProperties().getSpeedLimit());
+            Variables.get(name + 'V').set(Double.toString(speed));
         }
         TimeSign t = getTimer(name);
         t.duration = ParseUtil.parseTime(duration);
@@ -193,7 +190,7 @@ public class ArrivalSigns {
         }
 
         public boolean update() {
-            if (!TrainCarts.SignLinkEnabled) return false;
+            if (!TCConfig.SignLinkEnabled) return false;
             //Calculate the time to display
             String dur = getDuration();
             Variables.get(this.name).set(dur);

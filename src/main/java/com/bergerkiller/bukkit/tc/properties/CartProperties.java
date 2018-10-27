@@ -6,19 +6,23 @@ import com.bergerkiller.bukkit.common.utils.CommonUtil;
 import com.bergerkiller.bukkit.common.utils.LogicUtil;
 import com.bergerkiller.bukkit.common.utils.ParseUtil;
 import com.bergerkiller.bukkit.tc.Permission;
+import com.bergerkiller.bukkit.tc.TCConfig;
 import com.bergerkiller.bukkit.tc.TrainCarts;
 import com.bergerkiller.bukkit.tc.Util;
+import com.bergerkiller.bukkit.tc.attachments.config.AttachmentModel;
 import com.bergerkiller.bukkit.tc.controller.MinecartGroup;
 import com.bergerkiller.bukkit.tc.controller.MinecartMember;
 import com.bergerkiller.bukkit.tc.controller.MinecartMemberStore;
 import com.bergerkiller.bukkit.tc.storage.OfflineGroupManager;
 import com.bergerkiller.bukkit.tc.storage.OfflineMember;
+import com.bergerkiller.bukkit.tc.utils.SignSkipOptions;
 import com.bergerkiller.bukkit.tc.utils.SoftReference;
 import org.bukkit.Bukkit;
 import org.bukkit.ChatColor;
 import org.bukkit.Material;
 import org.bukkit.World;
 import org.bukkit.block.Block;
+import org.bukkit.entity.EntityType;
 import org.bukkit.entity.Player;
 import org.bukkit.util.Vector;
 
@@ -45,6 +49,9 @@ public class CartProperties extends CartPropertiesStore implements IProperties {
     private boolean pickUp = false;
     private boolean spawnItemDrops = true;
     private SoftReference<MinecartMember<?>> member = new SoftReference<>();
+    private SignSkipOptions skipOptions = new SignSkipOptions();
+    private AttachmentModel model = null;
+    private String driveSound = "";
 
     protected CartProperties(UUID uuid, TrainProperties group) {
         this.uuid = uuid;
@@ -64,11 +71,20 @@ public class CartProperties extends CartPropertiesStore implements IProperties {
         return "cart";
     }
 
+    /**
+     * Sets the holder of these properties. Internal use only.
+     * 
+     * @param holder
+     */
+    protected void setHolder(MinecartMember<?> holder) {
+        this.member.set(holder);
+    }
+
     @Override
     public MinecartMember<?> getHolder() {
         MinecartMember<?> member = this.member.get();
-        if (member == null || !member.isInteractable() || !member.getEntity().getUniqueId().equals(this.uuid)) {
-            return this.member.set(MinecartMemberStore.get(this.uuid));
+        if (member == null || member.getEntity() == null || !member.getEntity().getUniqueId().equals(this.uuid)) {
+            return this.member.set(MinecartMemberStore.getFromUID(this.uuid));
         } else {
             return member;
         }
@@ -103,13 +119,13 @@ public class CartProperties extends CartPropertiesStore implements IProperties {
     }
 
     /**
-     * Gets a collection of lower-case player names that are editing these properties
+     * Gets a collection of player UUIDs that are editing these properties
      *
-     * @return Collection of editing player names
+     * @return Collection of editing player UUIDs
      */
-    public Collection<String> getEditing() {
-        ArrayList<String> players = new ArrayList<>();
-        for (Map.Entry<String, CartProperties> entry : editing.entrySet()) {
+    public Collection<UUID> getEditing() {
+        ArrayList<UUID> players = new ArrayList<>();
+        for (Map.Entry<UUID, CartProperties> entry : editing.entrySet()) {
             if (entry.getValue() == this) {
                 players.add(entry.getKey());
             }
@@ -123,10 +139,10 @@ public class CartProperties extends CartPropertiesStore implements IProperties {
      * @return Collection of editing players
      */
     public Collection<Player> getEditingPlayers() {
-        Collection<String> names = getEditing();
-        ArrayList<Player> players = new ArrayList<>(names.size());
-        for (String name : names) {
-            Player p = Bukkit.getServer().getPlayer(name);
+        Collection<UUID> uuids = getEditing();
+        ArrayList<Player> players = new ArrayList<>(uuids.size());
+        for (UUID uuid : uuids) {
+            Player p = Bukkit.getServer().getPlayer(uuid);
             if (p != null) {
                 players.add(p);
             }
@@ -414,11 +430,56 @@ public class CartProperties extends CartPropertiesStore implements IProperties {
         this.lastPathNode = nodeName;
     }
 
+    /**
+     * Gets the attachment model set for this particular cart. If no model was previously set,
+     * a model is created based on the vanilla default model that is used. This model is not saved
+     * unless additional changes are made to it.
+     * 
+     * @return model set, null for Vanilla
+     */
+    public AttachmentModel getModel() {
+        if (this.model == null) {
+            // No model was set. Create a Vanilla model based on the Minecart information
+            MinecartMember<?> member = this.getHolder();
+            EntityType minecartType = (member == null) ? EntityType.MINECART : member.getEntity().getType();
+            this.model = AttachmentModel.getDefaultModel(minecartType);
+        }
+        return this.model;
+    }
+
+    /**
+     * Resets any set model, restoring the Minecart to its Vanilla defaults.
+     */
+    public void resetModel() {
+        if (this.model != null) {
+            MinecartMember<?> member = this.getHolder();
+            this.model.resetToDefaults((member == null) ? EntityType.MINECART : member.getEntity().getType());
+        }
+    }
+
+    /**
+     * Sets the attachment model to a named model from the attachment model store.
+     * The model will be stored as a named link when saved/reloaded.
+     * Calling this method will remove any model set for this minecart.
+     * 
+     * @param modelName
+     */
+    public void setModelName(String modelName) {
+        if (this.model == null) {
+            this.model = new AttachmentModel();
+        }
+        this.model.resetToName(modelName);
+    }
+
     @Override
     public boolean parseSet(String key, String arg) {
+        TrainPropertiesStore.markForAutosave();
         if (key.equals("exitoffset")) {
             Vector vec = Util.parseVector(arg, null);
             if (vec != null) {
+                if (vec.length() > TCConfig.maxEjectDistance) {
+                    vec.normalize().multiply(TCConfig.maxEjectDistance);
+                }
                 exitOffset = vec;
             }
         } else if (key.equals("exityaw")) {
@@ -443,7 +504,7 @@ public class CartProperties extends CartPropertiesStore implements IProperties {
             this.setTags(arg);
         } else if (key.equals("destination")) {
             this.setDestination(arg);
-        } else if (key.equals("remtag")) {
+        } else if (key.equals("remtag") || key.equals("removetag")) {
             this.removeTags(arg);
         } else if (key.equals("playerenter")) {
             this.setPlayersEnter(ParseUtil.parseBool(arg));
@@ -467,11 +528,18 @@ public class CartProperties extends CartPropertiesStore implements IProperties {
         } else if (key.equals("remowner")) {
             arg = arg.toLowerCase();
             this.getOwners().remove(arg);
+        } else if (key.equals("model")) {
+            setModelName(arg);
+        } else if (key.equals("clearmodel") || key.equals("resetmodel")) {
+            resetModel();
         } else if (LogicUtil.contains(key, "spawnitemdrops", "spawndrops", "killdrops")) {
             this.setSpawnItemDrops(ParseUtil.parseBool(arg));
+        } else if(key.equals("drivesound")) {
+            this.setDriveSound(arg);
         } else {
             return false;
         }
+        this.tryUpdate();
         return true;
     }
 
@@ -495,6 +563,7 @@ public class CartProperties extends CartPropertiesStore implements IProperties {
         this.exitYaw = from.exitYaw;
         this.exitPitch = from.exitPitch;
         this.spawnItemDrops = from.spawnItemDrops;
+        this.driveSound = from.driveSound;
     }
 
     @Override
@@ -517,10 +586,25 @@ public class CartProperties extends CartPropertiesStore implements IProperties {
         this.exitOffset = node.get("exitOffset", this.exitOffset);
         this.exitYaw = node.get("exitYaw", this.exitYaw);
         this.exitPitch = node.get("exitPitch", this.exitPitch);
+        this.driveSound = node.get("driveSound", this.driveSound);
         for (String blocktype : node.getList("blockBreakTypes", String.class)) {
             Material mat = ParseUtil.parseMaterial(blocktype, null);
             if (mat != null) {
                 this.blockBreakTypes.add(mat);
+            }
+        }
+        if (node.isNode("skipOptions")) {
+            this.skipOptions.load(node.getNode("skipOptions"));
+        }
+        if (this.model != null) {
+            if (node.isNode("model")) {
+                this.model.update(node.getNode("model").clone());
+            }
+        } else {
+            if (node.isNode("model")) {
+                this.model = new AttachmentModel(node.getNode("model").clone());
+            } else {
+                this.model = null;
             }
         }
     }
@@ -538,6 +622,7 @@ public class CartProperties extends CartPropertiesStore implements IProperties {
         node.set("exitOffset", this.exitOffset);
         node.set("exitYaw", this.exitYaw);
         node.set("exitPitch", this.exitPitch);
+        node.set("driveSound", this.driveSound);
         List<String> items = node.getList("blockBreakTypes", String.class);
         for (Material mat : this.blockBreakTypes) {
             items.add(mat.toString());
@@ -545,6 +630,12 @@ public class CartProperties extends CartPropertiesStore implements IProperties {
         node.set("destination", this.hasDestination() ? this.destination : "");
         node.set("enterMessage", this.hasEnterMessage() ? this.enterMessage : "");
         node.set("spawnItemDrops", this.spawnItemDrops);
+
+        if (this.model != null && !this.model.isDefault()) {
+            node.set("model", this.model.getConfig());
+        } else {
+            node.remove("model");
+        }
     }
 
     @Override
@@ -560,6 +651,7 @@ public class CartProperties extends CartPropertiesStore implements IProperties {
         node.set("exitOffset", this.exitOffset.lengthSquared() == 0.0 ? null : this.exitOffset);
         node.set("exitYaw", this.exitYaw == 0.0f ? null : this.exitYaw);
         node.set("exitPitch", this.exitPitch == 0.0f ? null : this.exitPitch);
+        node.set("driveSound", this.driveSound == "" ? null : this.driveSound);
         if (this.blockBreakTypes.isEmpty()) {
             node.remove("blockBreakTypes");
         } else {
@@ -572,6 +664,18 @@ public class CartProperties extends CartPropertiesStore implements IProperties {
         node.set("lastPathNode", LogicUtil.nullOrEmpty(this.lastPathNode) ? null : this.lastPathNode);
         node.set("enterMessage", this.hasEnterMessage() ? this.enterMessage : null);
         node.set("spawnItemDrops", this.spawnItemDrops ? null : false);
+
+        if (this.skipOptions.isActive()) {
+            this.skipOptions.save(node.getNode("skipOptions"));
+        } else if (node.contains("skipOptions")) {
+            node.remove("skipOptions");
+        }
+
+        if (this.model != null) {
+            node.set("model", this.model.getConfig());
+        } else {
+            node.remove("model");
+        }
     }
 
     /**
@@ -610,5 +714,23 @@ public class CartProperties extends CartPropertiesStore implements IProperties {
     @Override
     public void setPlayersExit(boolean state) {
         this.allowPlayerExit = state;
+    }
+
+    public SignSkipOptions getSkipOptions() {
+        return this.skipOptions;
+    }
+
+    public void setSkipOptions(SignSkipOptions options) {
+        this.skipOptions.filter = options.filter;
+        this.skipOptions.ignoreCtr = options.ignoreCtr;
+        this.skipOptions.skipCtr = options.skipCtr;
+    }
+
+    public String getDriveSound() {
+        return driveSound;
+    }
+
+    public void setDriveSound(String driveSound) {
+        this.driveSound = driveSound;
     }
 }

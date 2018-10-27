@@ -17,7 +17,7 @@ public class VirtualItem {
     private final ItemStack itemStack;
 
     public VirtualItem(Location location, ItemStack itemstack) {
-        item = (CommonItem) CommonEntity.create(EntityType.DROPPED_ITEM);
+        item = (CommonItem) CommonEntity.create(EntityType.DROPPED_ITEM, location);
         item.last.set(this.item.loc.set(location));
         item.vel.y.add(0.1);
         item.setItemStack(itemstack);

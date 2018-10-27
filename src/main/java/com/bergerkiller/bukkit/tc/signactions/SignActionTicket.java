@@ -1,21 +1,14 @@
 package com.bergerkiller.bukkit.tc.signactions;
 
-import com.bergerkiller.bukkit.common.utils.ParseUtil;
-import com.bergerkiller.bukkit.tc.Localization;
 import com.bergerkiller.bukkit.tc.Permission;
-import com.bergerkiller.bukkit.tc.TrainCarts;
-import com.bergerkiller.bukkit.tc.controller.MinecartMember;
+import com.bergerkiller.bukkit.tc.TCConfig;
 import com.bergerkiller.bukkit.tc.events.SignActionEvent;
 import com.bergerkiller.bukkit.tc.events.SignChangeActionEvent;
+/*
 import com.earth2me.essentials.register.payment.Method;
 import com.earth2me.essentials.register.payment.Method.MethodAccount;
 import com.earth2me.essentials.register.payment.Methods;
-import org.bukkit.entity.Player;
-
-import java.util.ArrayList;
-import java.util.List;
-
-import static com.bergerkiller.bukkit.tc.TrainCarts.getCurrencyText;
+*/
 
 /**
  * @author reeZZer
@@ -25,11 +18,13 @@ public class SignActionTicket extends SignAction {
 
     @Override
     public boolean match(SignActionEvent info) {
-        return TrainCarts.EssentialsEnabled && info.isType("ticket");
+        return TCConfig.EssentialsEnabled && info.isType("ticket");
     }
 
     @Override
     public void execute(SignActionEvent info) {
+        throw new RuntimeException("BROKEN");
+        /*
         final boolean isTrain;
         if (info.isCartSign() && info.isAction(SignActionType.MEMBER_ENTER, SignActionType.REDSTONE_ON)) {
             isTrain = false;
@@ -83,10 +78,11 @@ public class SignActionTicket extends SignAction {
                 }
             }
         }
+        */
     }
 
     @Override
     public boolean build(SignChangeActionEvent event) {
-        return event.getMode() != SignActionMode.NONE && handleBuild(event, Permission.BUILD_TICKET, "ticket system", "charges the passengers of a train");
+        return handleBuild(event, Permission.BUILD_TICKET, "ticket system", "charges the passengers of a train");
     }
 }

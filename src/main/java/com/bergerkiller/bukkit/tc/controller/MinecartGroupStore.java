@@ -1,13 +1,14 @@
 package com.bergerkiller.bukkit.tc.controller;
 
+import com.bergerkiller.bukkit.common.collections.ImplicitlySharedSet;
 import com.bergerkiller.bukkit.tc.TrainCarts;
+import com.bergerkiller.bukkit.tc.Util;
+import com.bergerkiller.bukkit.tc.controller.spawnable.SpawnableGroup;
+import com.bergerkiller.bukkit.tc.controller.spawnable.SpawnableMember;
 import com.bergerkiller.bukkit.tc.events.GroupCreateEvent;
 import com.bergerkiller.bukkit.tc.events.GroupLinkEvent;
 import com.bergerkiller.bukkit.tc.properties.TrainProperties;
-import com.bergerkiller.bukkit.tc.utils.TrackWalkIterator;
 import org.bukkit.Location;
-import org.bukkit.block.Block;
-import org.bukkit.block.BlockFace;
 import org.bukkit.entity.Entity;
 import org.bukkit.entity.EntityType;
 
@@ -15,33 +16,55 @@ import java.util.*;
 
 public class MinecartGroupStore extends ArrayList<MinecartMember<?>> {
     private static final long serialVersionUID = 1;
-    protected static HashSet<MinecartGroup> groups = new HashSet<>();
-    private static List<MinecartGroup> groupTickBuffer = new ArrayList<>(5);
+    protected static ImplicitlySharedSet<MinecartGroup> groups = new ImplicitlySharedSet<MinecartGroup>();
+    protected static boolean hasPhysicsChanges = false;
 
     /**
-     * Called onPhysics for all Minecart Groups who didn't get ticked in the previous run
-     * This is a sort of hack against the bugged issues on some server implementations
+     * Called onPhysics for all Minecart entities who didn't get ticked in the previous run.
+     * This is a sort of hack against the bugged issues on some server implementations.
      */
     public static void doFixedTick() {
-        groupTickBuffer.clear();
-        groupTickBuffer.addAll(groups);
-        try {
-            for (MinecartGroup group : groupTickBuffer) {
-                if (!group.ticked.clear()) {
-                    // Ticked was False, tick it now
-                    group.doPhysics();
-                    // Update the positions of the entities in the world(s)
+        try (ImplicitlySharedSet<MinecartGroup> groups_copy = groups.clone()) {
+            try {
+                for (MinecartGroup group : groups_copy) {
+                    // Tick the train if required
+                    if (!group.ticked.clear()) {
+                        group.doPhysics();
+                    }
+
+                    // Perform post-tick physics for all Minecarts in the train, if not previously ticked
                     for (MinecartMember<?> member : group) {
-                        member.getEntity().doPostTick();
+                        if (!member.ticked.clear()) {
+                            member.getEntity().doPostTick();
+                        }
                     }
                 }
+            } catch (Throwable t) {
+                TrainCarts.plugin.handle(t);
             }
-        } catch (Throwable t) {
-            TrainCarts.plugin.handle(t);
+        }
+    }
+
+    /**
+     * Executes the Entity doPostTick() on all trains.
+     * This ensures minecart entities are moved to the correct chunk they are in.
+     */
+    public static void doPostMoveLogic() {
+        try (ImplicitlySharedSet<MinecartGroup> groups_copy = groups.clone()) {
+            try {
+                for (MinecartGroup group : groups_copy) {
+                    for (MinecartMember<?> m : group) {
+                        m.getEntity().doPostTick();
+                    }
+                }
+            } catch (Throwable t) {
+                TrainCarts.plugin.handle(t);
+            }
         }
     }
 
     public static MinecartGroup create() {
+        Util.checkMainThread("MinecartGroupStore::create()");
         MinecartGroup g = new MinecartGroup();
         groups.add(g);
         return g;
@@ -52,14 +75,16 @@ public class MinecartGroupStore extends ArrayList<MinecartMember<?>> {
     }
 
     public static MinecartGroup create(String name, MinecartMember<?>... members) {
+        Util.checkMainThread("MinecartGroupStore::create(name, members)");
+
         // There is not a group with this name already?
         MinecartGroup g = new MinecartGroup();
         if (name != null) {
             g.setProperties(TrainProperties.get(name));
         }
         for (MinecartMember<?> member : members) {
-            if (member != null && !member.getEntity().isDead()) {
-                member.unloaded = false;
+            if (member != null && member.getEntity() != null && !member.getEntity().isDead()) {
+                member.setUnloaded(false);
                 g.add(member);
             }
         }
@@ -67,10 +92,34 @@ public class MinecartGroupStore extends ArrayList<MinecartMember<?>> {
         g.getAverageForce();
         groups.add(g);
         GroupCreateEvent.call(g);
+        g.onPropertiesChanged();
         return g;
     }
 
+    public static MinecartGroup spawn(SpawnableGroup spawnableGroup, List<Location> spawnLocations) {
+        List<SpawnableMember> types = spawnableGroup.getMembers();
+        if (types.size() > spawnLocations.size()) {
+            return null;
+        }
+
+        MinecartGroup group = MinecartGroup.create();
+        for (int i = spawnLocations.size() - 1; i >= 0; i--) {
+            Location spawnLoc = spawnLocations.get(i);
+            if (types.get(i).isFlipped()) {
+                spawnLoc = Util.invertRotation(spawnLoc);
+            }
+
+            // Spawn the minecart
+            group.add(types.get(i).spawn(spawnLoc));
+        }
+        group.updateDirection();
+        group.getProperties().load(spawnableGroup.getConfig());
+        GroupCreateEvent.call(group);
+        return group;
+    }
+
     public static MinecartGroup spawn(Location[] at, EntityType... types) {
+        Util.checkMainThread("MinecartGroupStore::spawn(at, types)");
         if (at.length != types.length || at.length == 0) return null;
         MinecartGroup g = new MinecartGroup();
         for (int i = 0; i < types.length; i++) {
@@ -78,22 +127,7 @@ public class MinecartGroupStore extends ArrayList<MinecartMember<?>> {
         }
         groups.add(g);
         GroupCreateEvent.call(g);
-        return g;
-    }
-
-    public static MinecartGroup spawn(Block startblock, BlockFace direction, EntityType... types) {
-        return spawn(startblock, direction, Arrays.asList(types));
-    }
-
-    public static MinecartGroup spawn(Block startblock, BlockFace direction, List<EntityType> types) {
-        Location[] destinations = TrackWalkIterator.walk(startblock, direction, types.size(), TrainCarts.cartDistance);
-        if (types.size() != destinations.length || destinations.length == 0) return null;
-        MinecartGroup g = new MinecartGroup();
-        for (int i = 0; i < destinations.length; i++) {
-            g.add(MinecartMemberStore.spawn(destinations[destinations.length - i - 1], types.get(i)));
-        }
-        groups.add(g);
-        GroupCreateEvent.call(g);
+        g.onPropertiesChanged();
         return g;
     }
 
@@ -118,22 +152,24 @@ public class MinecartGroupStore extends ArrayList<MinecartMember<?>> {
         return rval;
     }
 
-    public static Set<MinecartGroup> getGroupsUnsafe() {
+    /**
+     * Gets a set containing all the minecart groups on the server.
+     * When trains could be created while iterating, clone the set first.
+     * 
+     * @return shared set of all the groups on the server
+     */
+    public static ImplicitlySharedSet<MinecartGroup> getGroups() {
         return groups;
     }
 
-    public static MinecartGroup[] getGroups() {
-        return groups.toArray(new MinecartGroup[0]);
-    }
-
     public static MinecartGroup get(Entity e) {
-        final MinecartMember<?> mm = MinecartMemberStore.get(e);
+        final MinecartMember<?> mm = MinecartMemberStore.getFromEntity(e);
         return mm == null ? null : mm.getGroup();
     }
 
     public static MinecartGroup get(TrainProperties prop) {
         for (MinecartGroup group : groups) {
-            if (group.getProperties() == prop) return group;
+            if (group.isPropertiesEqual(prop)) return group;
         }
         return null;
     }
@@ -186,8 +222,8 @@ public class MinecartGroupStore extends ArrayList<MinecartMember<?>> {
             }
 
             //Clear targets and active signs
-            g1.getBlockTracker().clear();
-            g2.getBlockTracker().clear();
+            g1.getSignTracker().clear();
+            g2.getSignTracker().clear();
 
             //Finally link
             if (m1index == 0 && m2index == 0) {
@@ -204,12 +240,21 @@ public class MinecartGroupStore extends ArrayList<MinecartMember<?>> {
             //Correct the yaw and order
             g2.getAverageForce();
             g2.updateDirection();
-            g2.getBlockTracker().updatePosition();
+            g2.getSignTracker().updatePosition();
 
             g1.remove();
             m2.playLinkEffect();
             return true;
         }
         return false;
+    }
+
+    /**
+     * Tells the underlying system that physics have changed. This can mean a block changed
+     * type or some other logic that can alter the behavior of a train. Changes that occur
+     * during physics will force a train to recalculate rail information.
+     */
+    public static void notifyPhysicsChange() {
+        hasPhysicsChanges = true;
     }
 }

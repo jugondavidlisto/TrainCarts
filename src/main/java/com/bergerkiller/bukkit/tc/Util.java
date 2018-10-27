@@ -1,50 +1,88 @@
 package com.bergerkiller.bukkit.tc;
 
-import com.avaje.ebeaninternal.server.deploy.BeanDescriptor.EntityType;
-import com.bergerkiller.bukkit.common.Common;
 import com.bergerkiller.bukkit.common.MaterialTypeProperty;
+import com.bergerkiller.bukkit.common.config.ConfigurationNode;
 import com.bergerkiller.bukkit.common.conversion.Conversion;
 import com.bergerkiller.bukkit.common.inventory.ItemParser;
-import com.bergerkiller.bukkit.common.reflection.FieldAccessor;
-import com.bergerkiller.bukkit.common.reflection.MethodAccessor;
-import com.bergerkiller.bukkit.common.reflection.SafeField;
-import com.bergerkiller.bukkit.common.reflection.SafeMethod;
-import com.bergerkiller.bukkit.common.reflection.classes.BlockRef;
+import com.bergerkiller.bukkit.common.math.Quaternion;
 import com.bergerkiller.bukkit.common.utils.*;
+import com.bergerkiller.bukkit.common.wrappers.BlockData;
+import com.bergerkiller.bukkit.tc.cache.RailSignCache;
+import com.bergerkiller.bukkit.tc.controller.components.RailJunction;
+import com.bergerkiller.bukkit.tc.controller.components.RailPath;
 import com.bergerkiller.bukkit.tc.properties.IParsable;
 import com.bergerkiller.bukkit.tc.properties.IProperties;
 import com.bergerkiller.bukkit.tc.properties.IPropertiesHolder;
 import com.bergerkiller.bukkit.tc.rails.type.RailType;
 import com.bergerkiller.bukkit.tc.utils.AveragedItemParser;
 import com.bergerkiller.bukkit.tc.utils.TrackIterator;
+import com.bergerkiller.bukkit.tc.utils.TrackMovingPoint;
+import com.bergerkiller.bukkit.tc.utils.TrackWalkingPoint;
+import com.bergerkiller.generated.net.minecraft.server.ChunkHandle;
+import com.bergerkiller.generated.net.minecraft.server.EntityTrackerEntryHandle;
+import com.bergerkiller.mountiplex.reflection.MethodAccessor;
+import com.bergerkiller.mountiplex.reflection.SafeDirectMethod;
+import com.bergerkiller.mountiplex.reflection.SafeMethod;
+import com.bergerkiller.reflection.net.minecraft.server.NMSBlock;
+import com.bergerkiller.reflection.net.minecraft.server.NMSItem;
+import com.bergerkiller.reflection.net.minecraft.server.NMSMaterial;
+
+import org.bukkit.Chunk;
+import org.bukkit.Location;
 import org.bukkit.Material;
+import org.bukkit.Particle;
 import org.bukkit.World;
 import org.bukkit.block.Block;
 import org.bukkit.block.BlockFace;
+import org.bukkit.block.Sign;
 import org.bukkit.entity.Entity;
 import org.bukkit.entity.HumanEntity;
 import org.bukkit.entity.LivingEntity;
+import org.bukkit.entity.Player;
+import org.bukkit.event.block.SignChangeEvent;
+import org.bukkit.inventory.Inventory;
+import org.bukkit.inventory.ItemStack;
 import org.bukkit.material.MaterialData;
 import org.bukkit.material.Stairs;
+import org.bukkit.material.Step;
 import org.bukkit.util.Vector;
 
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.List;
+import java.util.Locale;
+import java.util.logging.Level;
 
 public class Util {
     public static final MaterialTypeProperty ISVERTRAIL = new MaterialTypeProperty(Material.LADDER);
     public static final MaterialTypeProperty ISTCRAIL = new MaterialTypeProperty(ISVERTRAIL, MaterialUtil.ISRAILS, MaterialUtil.ISPRESSUREPLATE);
     private static final String SEPARATOR_REGEX = "[|/\\\\]";
-    private static final FieldAccessor<Object> blockMaterial = BlockRef.TEMPLATE.getField("material");
-    private static final MethodAccessor<Boolean> materialBuildable = new SafeMethod<Boolean>(Common.NMS_ROOT + ".Material.isBuildable");
-    private static final FieldAccessor<Integer> itemMaxSizeField = new SafeField<Integer>(CommonUtil.getNMSClass("Item"), "maxStackSize");
-    private static BlockFace[] possibleFaces = {BlockFace.UP, BlockFace.NORTH, BlockFace.EAST, BlockFace.SOUTH, BlockFace.WEST, BlockFace.DOWN};
     private static List<Block> blockbuff = new ArrayList<Block>();
 
     public static void setItemMaxSize(Material material, int maxstacksize) {
-        itemMaxSizeField.set(Conversion.toItemHandle.convert(material), maxstacksize);
+        NMSItem.maxStackSize.set(Conversion.toItemHandle.convert(material), maxstacksize);
+    }
+
+    /**
+     * Returns the minimal index into a String, exempting the -1 constant. Examples:
+     * <ul>
+     * <li>minStringIndex(-1, 2) == 2</li>
+     * <li>minStringIndex(3, -1) == 3</li>
+     * <li>minStringIndex(5, 12) == 5</li>
+     * <li>minStringIndex(-1, -1) == -1</li>
+     * </ul>
+     * 
+     * @param a index1
+     * @param b index2
+     * @return minimal index.
+     */
+    public static int minStringIndex(int a, int b) {
+        if (a == -1 || b == -1) {
+            return (a > b) ? a : b;
+        } else {
+            return (a < b) ? a : b;
+        }
     }
 
     /**
@@ -96,42 +134,35 @@ public class Util {
         }
     }
 
+    /**
+     * <b>Deprecated: use {@link RailSignCache#getSigns(RailType, Block)} instead</b>
+     */
+    @Deprecated
     public static List<Block> getSignsFromRails(Block railsblock) {
         return getSignsFromRails(blockbuff, railsblock);
     }
 
+    /**
+     * <b>Deprecated: use {@link RailSignCache#getSigns(RailType, Block)} instead</b>
+     */
+    @Deprecated
     public static List<Block> getSignsFromRails(List<Block> rval, Block railsblock) {
         rval.clear();
         addSignsFromRails(rval, railsblock);
         return rval;
     }
 
+    /**
+     * <b>Deprecated: use {@link RailSignCache#getSigns(RailType, Block)} instead</b>
+     */
+    @Deprecated
     public static void addSignsFromRails(List<Block> rval, Block railsBlock) {
-        BlockFace dir = RailType.getType(railsBlock).getSignColumnDirection(railsBlock);
-        // Has sign support at all?
-        if (dir == null || dir == BlockFace.SELF) {
+        RailType railType = RailType.getType(railsBlock);
+        if (railType == RailType.NONE) {
             return;
         }
-        addSignsFromRails(rval, railsBlock, dir);
-    }
-
-    public static void addSignsFromRails(List<Block> rval, Block railsBlock, BlockFace signDirection) {
-        final boolean hasSignPost = FaceUtil.isVertical(signDirection);
-
-        // Ignore mid-sections
-        Block currentBlock = railsBlock.getRelative(signDirection);
-        addAttachedSigns(currentBlock, rval);
-        currentBlock = currentBlock.getRelative(signDirection);
-        // Keep going into the sign direction
-        while (true) {
-            if (hasSignPost && MaterialUtil.isType(currentBlock, Material.SIGN_POST)) {
-                // Found a sign post - add it and continue
-                rval.add(currentBlock);
-            } else if (!addAttachedSigns(currentBlock, rval)) {
-                // No wall signs found either - end it here
-                break;
-            }
-            currentBlock = currentBlock.getRelative(signDirection);
+        for (RailSignCache.TrackedSign trackedSign : RailSignCache.getSigns(railType, railsBlock)) {
+            rval.add(trackedSign.signBlock);
         }
     }
 
@@ -154,43 +185,7 @@ public class Util {
     }
 
     public static Block getRailsFromSign(Block signblock) {
-        if (signblock == null) {
-            return null;
-        }
-
-        final Material type = signblock.getType();
-        final Block mainBlock;
-        if (type == Material.WALL_SIGN) {
-            mainBlock = BlockUtil.getAttachedBlock(signblock);
-        } else if (type == Material.SIGN_POST) {
-            mainBlock = signblock;
-        } else {
-            return null;
-        }
-        boolean hasSigns;
-        for (BlockFace dir : possibleFaces) {
-            Block block = mainBlock;
-            hasSigns = true;
-            while (true) {
-                // Go to the next block
-                block = block.getRelative(dir);
-
-                // Check for rails
-                BlockFace columnDir = RailType.getType(block).getSignColumnDirection(block);
-                if (dir == columnDir.getOppositeFace()) {
-                    return block;
-                }
-
-                // End of the loop?
-                if (!hasSigns) {
-                    break;
-                }
-
-                // Go to the next block
-                hasSigns = hasAttachedSigns(block);
-            }
-        }
-        return null;
+        return RailSignCache.getRailsFromSign(signblock);
     }
 
     public static Block findRailsVertical(Block from, BlockFace mode) {
@@ -200,15 +195,17 @@ public class Util {
         World world = from.getWorld();
         if (mode == BlockFace.DOWN) {
             for (int y = sy - 1; y > 0; --y) {
-                if (ISTCRAIL.get(world, x, y, z)) {
-                    return world.getBlockAt(x, y, z);
+                Block block = world.getBlockAt(x, y, z);
+                if (RailType.getType(block) != RailType.NONE) {
+                    return block;
                 }
             }
         } else if (mode == BlockFace.UP) {
             int height = world.getMaxHeight();
             for (int y = sy + 1; y < height; y++) {
-                if (ISTCRAIL.get(world, x, y, z)) {
-                    return world.getBlockAt(x, y, z);
+                Block block = world.getBlockAt(x, y, z);
+                if (RailType.getType(block) != RailType.NONE) {
+                    return block;
                 }
             }
         }
@@ -348,6 +345,18 @@ public class Util {
     }
 
     /**
+     * Checks if a given rails block has a vertical rail below facing the direction specified
+     *
+     * @param rails     to check
+     * @param direction of the vertical rail
+     * @return True if a vertical rail is below, False if not
+     */
+    public static boolean isVerticalBelow(Block rails, BlockFace direction) {
+        Block below = rails.getRelative(BlockFace.DOWN);
+        return Util.ISVERTRAIL.get(below) && getVerticalRailDirection(below) == direction;
+    }
+
+    /**
      * Gets the direction a vertical rail pushes the minecart (the wall side)
      *
      * @param railsBlock of the vertical rail
@@ -483,6 +492,23 @@ public class Util {
         }
     }
 
+    /**
+     * Gets whether a particular entity is in a state of destroying minecarts instantly.
+     * This is when they are in creative mode, and only when not sneaking (players).
+     * 
+     * @param entity to check
+     * @return True if the entity can instantly destroy a minecart, False if not
+     */
+    public static boolean canInstantlyBreakMinecart(Entity entity) {
+        if (!TCConfig.instantCreativeDestroy || !canInstantlyBuild(entity)) {
+            return false;
+        }
+        if (entity instanceof Player && ((Player) entity).isSneaking()) {
+            return false;
+        }
+        return true;
+    }
+
     public static boolean canInstantlyBuild(Entity entity) {
         return entity instanceof HumanEntity && EntityUtil.getAbilities((HumanEntity) entity).canInstantlyBuild();
     }
@@ -496,17 +522,17 @@ public class Util {
      * @return True if supported, False if not
      */
     public static boolean isSupportedFace(Block block, BlockFace face) {
-        Material type = block.getType();
-        if (MaterialUtil.ISSOLID.get(type)) {
+        BlockData block_data = WorldUtil.getBlockData(block);
+        if (MaterialUtil.ISSOLID.get(block_data)) {
             return true;
         }
+
         // Special block types that only support one face at a time
-        int rawData = MaterialUtil.getRawData(block);
-        MaterialData data = BlockUtil.getData(type, rawData);
+        MaterialData data = block_data.getMaterialData();
 
         // Steps only support TOP or BOTTOM
-        if (MaterialUtil.isType(type, Material.WOOD_STEP, Material.STEP)) {
-            return face == FaceUtil.getVertical((rawData & 0x8) == 0x8);
+        if (data instanceof Step) {
+            return face == FaceUtil.getVertical(((Step) data).isInverted());
         }
 
         // Stairs only support the non-exit side + the up/down
@@ -524,28 +550,35 @@ public class Util {
         return false;
     }
 
+    public static boolean isSignSupported(Block block) {
+        Block attached = BlockUtil.getAttachedBlock(block);
+        // Only check the 'isBuildable' state of the Material
+        Object attachedHandle = Conversion.toBlockHandle.convert(attached);
+        if (attachedHandle == null) {
+            return false;
+        }
+        Object material = NMSBlock.material.get(attachedHandle);
+        if (material == null) {
+            return false;
+        }
+        return NMSMaterial.materialBuildable.invoke(material);
+    }
+
     public static boolean isSupported(Block block) {
+        if (MaterialUtil.ISSIGN.get(block)) {
+            return isSignSupported(block);
+        }
+
         BlockFace attachedFace = BlockUtil.getAttachedFace(block);
         Block attached = block.getRelative(attachedFace);
-        if (MaterialUtil.ISSIGN.get(block)) {
-            // Only check the 'isBuildable' state of the Material
-            Object attachedHandle = Conversion.toBlockHandle.convert(attached);
-            if (attachedHandle == null) {
-                return false;
-            }
-            Object material = blockMaterial.get(attachedHandle);
-            if (material == null) {
-                return false;
-            }
-            return materialBuildable.invoke(material);
-        }
+
         // For all other cases, check whether the side is properly supported
         return isSupportedFace(attached, attachedFace.getOppositeFace());
     }
 
     public static boolean isValidEntity(String entityName) {
         try {
-            return EntityType.valueOf(entityName) != null;
+            return org.bukkit.entity.EntityType.valueOf(entityName) != null;
         } catch (Exception ex) {
             return false;
         }
@@ -565,9 +598,6 @@ public class Util {
             offset.setY(ParseUtil.parseDouble(offsettext[0], 0.0));
         } else {
             return def;
-        }
-        if (offset.length() > TrainCarts.maxEjectDistance) {
-            offset.normalize().multiply(TrainCarts.maxEjectDistance);
         }
         return offset;
     }
@@ -603,6 +633,22 @@ public class Util {
      * @return straight length
      */
     public static double calculateStraightLength(Block railsBlock, BlockFace direction) {
+        TrackWalkingPoint p = new TrackWalkingPoint(railsBlock, direction);
+        Vector start_dir = null;
+        while (p.movedTotal < 20.0 && p.move(0.1)) {
+            if (start_dir == null) {
+                start_dir = p.state.motionVector();
+            } else {
+                // Verify that the start and current motion vector are still somewhat the same
+                // Somewhat is subjective, so use the dot product and hope for the best
+                if (p.state.position().motDot(start_dir) < 0.75) {
+                    break;
+                }
+            }
+        }
+        return p.movedTotal;
+        
+        /*
         // Read track information and parameters
         RailType type = RailType.getType(railsBlock);
         boolean diagonal = FaceUtil.isSubCardinal(type.getDirection(railsBlock));
@@ -669,5 +715,449 @@ public class Util {
             }
         }
         return length;
+        */
     }
+
+    /**
+     * Attempts to parse the text as time ticks, converting values such as '12s' and '500ms' into ticks.
+     * If no time statement is found, -1 is returned.
+     * 
+     * @param text to parse as time
+     * @return time ticks, or -1 if not parsed
+     */
+    public static int parseTimeTicks(String text) {
+        text = text.toLowerCase(Locale.ENGLISH);
+        double ticks = -1.0;
+        if (text.endsWith("ms")) {
+            ticks = 0.02 * ParseUtil.parseDouble(text.substring(0, text.length() - 2), -1);
+        } else if (text.endsWith("m")) {
+            ticks = 1200.0 * ParseUtil.parseDouble(text.substring(0, text.length() - 1), -1);
+        } else if (text.endsWith("s")) {
+            ticks = 20.0 * ParseUtil.parseDouble(text.substring(0, text.length() - 1), -1);
+        } else if (text.endsWith("t")) {
+            ticks = ParseUtil.parseInt(text.substring(0, text.length() - 1), -1);
+        }
+        return (ticks < 0.0) ? -1 : (int) ticks;
+    }
+
+    /**
+     * Will return for hexcode for every char
+     * @param unicode to get hexcode for
+     * @return hexcode, in unicode format
+     */
+    public static String getUnicode(char unicode) {
+        return "\\u" + Integer.toHexString( unicode | 0x10000).substring(1);
+    }
+
+    /**
+     * Reads a line from a sign change event and clears characters that can't be parsed by TC.
+     * If the line contains no invalid characters, the exact same String is returned
+     * without the overhead of allocating a new String.
+     * If the line is null, an empty String is returned instead.
+     * A null event will also result in an empty String.
+     * 
+     * @param event to get a clean line of
+     * @param line index
+     * @return clean line of the sign, guaranteed to never be null or have invalid characters
+     */
+    public static String getCleanLine(SignChangeEvent event, int line) {
+        if (event == null) {
+            return "";
+        } else {
+            return cleanSignLine(event.getLine(line));
+        }
+    }
+
+    /**
+     * Reads a line from a sign and clears characters that can't be parsed by TC.
+     * If the line contains no invalid characters, the exact same String is returned
+     * without the overhead of allocating a new String.
+     * If the line is null, an empty String is returned instead.
+     * A null sign will also result in an empty String.
+     * 
+     * @param sign to get a clean line of
+     * @param line index
+     * @return clean line of the sign, guaranteed to never be null or have invalid characters
+     */
+    public static String getCleanLine(Sign sign, int line) {
+        if (sign == null) {
+            return "";
+        } else {
+            return cleanSignLine(sign.getLine(line));
+        }
+    }
+
+    /**
+     * Clears input of characters that can't be parsed by TC.
+     * If the line contains no invalid characters, the exact same String is returned
+     * without the overhead of allocating a new String.
+     * If the line is null, an empty String is returned instead.
+     * 
+     * @param line to parse
+     * @return line cleared from invalid characters
+     */
+    public static String cleanSignLine(String line) {
+        if (line == null) {
+            return "";
+        }
+        for (int i = 0; i < line.length(); i++) {
+            if (isInvalidCharacter(line.charAt(i))) {
+                // One or more character is invalid
+                // Proceed to create a new String with these characters removed
+                StringBuilder clear = new StringBuilder(line.length() - 1);
+                clear.append(line, 0, i);
+                for (int j = i + 1; j < line.length(); j++) {
+                    char c = line.charAt(j);
+                    if (!isInvalidCharacter(c)) {
+                        clear.append(c);
+                    }
+                }
+                return clear.toString();
+            }
+        }
+        return line; // no invalid characters, return input String
+    }
+
+    /**
+     * Clears input sign lines of characters that can't be parsed by TC.
+     * If none of the lines contain invalid characters, the exact same String[] array
+     * is returned without the overhead of allocating a new String[] array.
+     * If the input array is null, or its length is not 4, it is resized so it is
+     * using a newly allocated array. The lines are guaranteed to not be null.
+     * 
+     * @param lines to parse
+     * @return lines cleared from invalid characters
+     */
+    public static String[] cleanSignLines(String[] lines) {
+        if (lines == null) {
+            return new String[] {"", "", "", ""};
+        }
+
+        // Create a new array of Strings only if one of the lines has invalid characters
+        boolean hasInvalid = false;
+        if (lines.length != 4) {
+            hasInvalid = true;
+            String[] newLines = new String[] {"", "", "", ""};
+            for (int i = 0; i < Math.min(lines.length, 4); i++) {
+                newLines[i] = lines[i];
+            }
+            lines = newLines;
+        }
+
+        // We do so using a String identity check (equals is unneeded)
+        // Only when trimInvalidCharacters returns a new String do we update the input array
+        for (int i = 0; i < lines.length; i++) {
+            String oldLine = lines[i];
+            String newLine = cleanSignLine(oldLine);
+            if (oldLine != newLine) {
+                if (!hasInvalid) {
+                    hasInvalid = true;
+                    lines = lines.clone();
+                }
+                lines[i] = newLine;
+            }
+        }
+        return lines;
+    }
+
+    /**
+     * Checks whether a particular character is valid on TrainCarts signs.
+     * Control codes and other unsupported characters return True.
+     * 
+     * @param c character to test
+     * @return True if the character is invalid
+     */
+    public static boolean isInvalidCharacter(char c) {
+        return Character.getType(c) == Character.PRIVATE_USE;
+    }
+
+    /**
+     * Checks whether Minecraft's crappy rotation system will crap out when rotating
+     * from one angle to another
+     * 
+     * @param angleOld
+     * @param angleNew
+     * @return angle of the rotation performed
+     */
+    public static boolean isProtocolRotationGlitched(float angleOld, float angleNew) {
+        int protOld = EntityTrackerEntryHandle.getProtocolRotation(angleOld);
+        int protNew = EntityTrackerEntryHandle.getProtocolRotation(angleNew);
+        return Math.abs(protNew - protOld) > 128;
+    }
+
+    /**
+     * For debugging: spawns a particle at a particular location
+     * 
+     * @param loc to spawn at
+     * @param particle to spawn
+     */
+    public static void spawnParticle(Location loc, Particle particle) {
+        loc.getWorld().spawnParticle(particle, loc, 1);
+    }
+
+    public static void spawnBubble(Location loc) {
+        spawnParticle(loc, Particle.WATER_BUBBLE);
+    }
+
+    /**
+     * Spawns a colored dust particle, the color can be specified
+     * 
+     * @param loc to spawn at
+     * @param red color value [0.0 ... 1.0]
+     * @param green color value [0.0 ... 1.0]
+     * @param blue color value [0.0 ... 1.0]
+     */
+    public static void spawnDustParticle(Location loc, double red, double green, double blue) {
+        int c_red = (int) MathUtil.clamp(255.0 * red, 0.0, 255.0);
+        int c_green = (int) MathUtil.clamp(255.0 * green, 0.0, 255.0);
+        int c_blue = (int) MathUtil.clamp(255.0 * blue, 0.0, 255.0);
+        org.bukkit.Color color = org.bukkit.Color.fromRGB(c_red, c_green, c_blue);
+        Vector position = loc.toVector();
+        for (Player player : loc.getWorld().getPlayers()) {
+            if (player.getLocation().distanceSquared(loc) > (256.0*256.0)) {
+                continue;
+            }
+            PlayerUtil.spawnDustParticles(player, position, color);
+        }
+    }
+
+    /**
+     * Rotates the yaw/pitch of a Location to invert the direction it is pointing into
+     * 
+     * @param loc to rotate
+     * @return input loc (loc is modified)
+     */
+    public static Location invertRotation(Location loc) {
+        //TODO: Maybe this can be done without Quaternion?
+        Quaternion q = Quaternion.fromYawPitchRoll(loc.getPitch(), loc.getYaw(), 0.0);
+        q.rotateYFlip();
+        Vector ypr_new = q.getYawPitchRoll();
+        loc.setYaw((float) ypr_new.getY());
+        loc.setPitch((float) ypr_new.getX());
+        return loc;
+    }
+
+    // some magic to turn a vector into the most appropriate block face
+    public static BlockFace vecToFace(Vector vector, boolean useSubCardinalDirections) {
+        return vecToFace(vector.getX(), vector.getY(), vector.getZ(), useSubCardinalDirections);
+    }
+
+    // some magic to turn a vector into the most appropriate block face
+    public static BlockFace vecToFace(double dx, double dy, double dz, boolean useSubCardinalDirections) {
+        double sqlenxz = dx*dx + dz*dz;
+        double sqleny = dy*dy;
+        if (sqleny > (sqlenxz + 1e-6)) {
+            return FaceUtil.getVertical(dy);
+        } else {
+            return FaceUtil.getDirection(dx, dz, useSubCardinalDirections);
+        }
+    }
+
+    /**
+     * Linearly interpolates an orientation 'up' vector between two stages, performing a clean
+     * rotation between the two.
+     * 
+     * @param up0
+     * @param up1
+     * @param theta
+     * @return orientation up-vector at theta
+     */
+    public static Vector lerpOrientation(Vector up0, Vector up1, double theta) {
+        Quaternion qa = Quaternion.fromLookDirection(up0);
+        Quaternion qb = Quaternion.fromLookDirection(up1);
+        Quaternion q = Quaternion.slerp(qa, qb, theta);
+        return q.forwardVector();
+    }
+
+    /**
+     * Linearly interpolates an orientation 'up' vector between two stages, performing a clean
+     * rotation between the two.
+     * 
+     * @param result to store the lerp result into
+     * @param p0
+     * @param p1
+     * @param theta
+     */
+    public static void lerpOrientation(RailPath.Position result, RailPath.Point p0, RailPath.Point p1, double theta) {
+        Vector vup0 = p0.up();
+        Vector vup1 = p1.up();
+        Vector vup = lerpOrientation(vup0, vup1, theta);
+        result.upX = vup.getX();
+        result.upY = vup.getY();
+        result.upZ = vup.getZ();
+    }
+
+    /**
+     * Calculates the 3 rotation angles for an armor stand pose from a Quaternion rotation
+     * 
+     * @param rotation
+     * @return armor stand x/y/z rotation angles
+     */
+    public static Vector getArmorStandPose(Quaternion rotation) {
+        double qx = rotation.getX();
+        double qy = rotation.getY();
+        double qz = rotation.getZ();
+        double qw = rotation.getW();
+
+        double rx = 1.0 + 2.0 * (-qy*qy-qz*qz);
+        double ry = 2.0 * (qx*qy+qz*qw);
+        double rz = 2.0 * (qx*qz-qy*qw);
+        double uz = 2.0 * (qy*qz+qx*qw);
+        double fz = 1.0 + 2.0 * (-qx*qx-qy*qy);
+
+        if (Math.abs(rz) < (1.0 - 1E-15)) {
+            // Standard calculation
+            return new Vector(Math.toDegrees(Math.atan2(uz, fz)),
+                              Math.toDegrees(Math.asin(rz)),
+                              Math.toDegrees(Math.atan2(-ry, rx)));
+        } else {
+            // At the -90 or 90 degree angle singularity
+            final double sign = (rz < 0) ? -1.0 : 1.0;
+            return new Vector(0.0, sign * 90.0,
+                    Math.toDegrees(-sign * 2.0 * Math.atan2(qx, qw)));
+        }
+    }
+
+    /**
+     * Calculates the next Minecart block position when going on a rail block in a particular direction.
+     * This logic is largely deprecated and is only used in places where there is no alternative possible yet.
+     * 
+     * @param railBlock
+     * @param direction
+     * @return next minecart Block position, null if no such rail exists
+     */
+    public static Block getNextPos(Block railBlock, BlockFace direction) {
+        TrackMovingPoint p = new TrackMovingPoint(railBlock, direction);
+        if (!p.hasNext()) {
+            return null;
+        }
+        p.next();
+        if (!p.hasNext()) {
+            return null;
+        }
+        p.next(false);
+        return p.current;
+    }
+
+    /**
+     * Marks a chunk as dirty, so that it is saved again when it unloads
+     * 
+     * @param chunk
+     */
+    public static final void markChunkDirty(Chunk chunk) {
+        ChunkHandle.fromBukkit(chunk).markDirty();
+    }
+
+    /**
+     * Attempts to find the most appropriate junction for a BlockFace wind direction.
+     * This is used when switcher signs have to switch rails based on wind directions, but
+     * no wind direction names are used for the junction names. This is also used for sign-relative
+     * left/right/forward/backward logic, which is first turned into a BlockFace.
+     * 
+     * @param junctions to select from
+     * @param face to find
+     * @return the best matching junction, null if not found
+     */
+    public static RailJunction faceToJunction(List<RailJunction> junctions, BlockFace face) {
+        for (RailJunction junc : junctions) {
+            if (junc.position().getMotionFace() == face) {
+                return junc;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Checks for a 'contents' field in the configuration, and if it exists, loads
+     * all items contained within. The inventory is wiped beforehand.
+     * 
+     * @param inventory
+     * @param config
+     */
+    public static void loadInventoryFromConfig(Inventory inventory, ConfigurationNode config) {
+        inventory.clear();
+        if (config.isNode("contents")) {
+            ConfigurationNode contents = config.getNode("contents");
+            for (String indexStr : contents.getKeys()) {
+                int index;
+                try {
+                    index = Integer.parseInt(indexStr);
+                } catch (NumberFormatException ex) {
+                    continue;
+                }
+                ItemStack item = contents.get(indexStr, ItemStack.class);
+                if (!ItemUtil.isEmpty(item)) {
+                    inventory.setItem(index, item.clone());
+                }
+            }
+        }
+    }
+
+    /**
+     * Saves all items in the inventory to the configuration under a 'contents' field. If
+     * the inventory is empty, nothing is saved.
+     * 
+     * @param inventory
+     * @param config
+     */
+    public static void saveInventoryToConfig(Inventory inventory, ConfigurationNode config) {
+        ConfigurationNode contents = null;
+        for (int i = 0; i < inventory.getSize(); i++) {
+            ItemStack item = inventory.getItem(i);
+            if (!ItemUtil.isEmpty(item)) {
+                if (contents == null) {
+                    contents = config.getNode("contents");
+                }
+                contents.set(Integer.toString(i), item.clone());
+            }
+        }
+    }
+
+    /**
+     * Sets the value of a vector to that of another
+     * 
+     * @param v to set
+     * @param v2 to set the x/y/z values to
+     */
+    public static void setVector(Vector v, Vector v2) {
+        v.setX(v2.getX());
+        v.setY(v2.getY());
+        v.setZ(v2.getZ());
+    }
+
+    /**
+     * Checks whether a method is called from a thread other than the main thread.
+     * 
+     * @param what descriptor what was called
+     */
+    public static void checkMainThread(String what) {
+        if (!CommonUtil.isMainThread()) {
+            TrainCarts.plugin.log(Level.WARNING, what + " called from a thread other than the main thread!");
+            Thread.dumpStack();
+        }
+    }
+
+    /**
+     * Proxy for BlockData canSupportTop(), with a fallback for older BKCommonLib versions.
+     * Can be removed once we are depending solely on BKC 1.13.1-v2 or later.
+     * 
+     * @param data
+     * @return True if top of the Block can support
+     */
+    public static boolean canSupportTop(BlockData data) {
+        if (_bkc_blockdata_cansupporttop == null) {
+            if (SafeMethod.contains(BlockData.class, "canSupportTop")) {
+                _bkc_blockdata_cansupporttop = new SafeMethod<Boolean>(BlockData.class, "canSupportTop");
+            } else {
+                _bkc_blockdata_cansupporttop = new SafeDirectMethod<Boolean>() {
+                    @Override
+                    public Boolean invoke(Object arg0, Object... arg1) {
+                        return MaterialUtil.ISSOLID.get((BlockData) arg0);
+                    }
+                };
+            }
+        }
+        return _bkc_blockdata_cansupporttop.invoke(data);
+    }
+    private static MethodAccessor<Boolean> _bkc_blockdata_cansupporttop = null;
 }

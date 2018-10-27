@@ -1,30 +1,56 @@
 package com.bergerkiller.bukkit.tc.controller;
 
+import com.bergerkiller.bukkit.common.Timings;
 import com.bergerkiller.bukkit.common.bases.mutable.VectorAbstract;
 import com.bergerkiller.bukkit.common.controller.EntityNetworkController;
 import com.bergerkiller.bukkit.common.entity.type.CommonMinecart;
+import com.bergerkiller.bukkit.common.math.Matrix4x4;
 import com.bergerkiller.bukkit.common.protocol.CommonPacket;
-import com.bergerkiller.bukkit.common.protocol.PacketType;
+import com.bergerkiller.bukkit.common.utils.CommonUtil;
 import com.bergerkiller.bukkit.common.utils.LogicUtil;
 import com.bergerkiller.bukkit.common.utils.MathUtil;
 import com.bergerkiller.bukkit.common.utils.PacketUtil;
+import com.bergerkiller.bukkit.common.utils.WorldUtil;
+import com.bergerkiller.bukkit.common.wrappers.EntityTracker;
+import com.bergerkiller.bukkit.tc.TCTimings;
 import com.bergerkiller.bukkit.tc.TrainCarts;
+import com.bergerkiller.bukkit.tc.attachments.config.AttachmentModel;
+import com.bergerkiller.bukkit.tc.attachments.config.AttachmentModelOwner;
+import com.bergerkiller.bukkit.tc.attachments.control.CartAttachment;
+import com.bergerkiller.bukkit.tc.attachments.control.CartAttachmentSeat;
+import com.bergerkiller.bukkit.tc.attachments.control.PassengerController;
+import com.bergerkiller.generated.net.minecraft.server.EntityHandle;
+import com.bergerkiller.generated.net.minecraft.server.EntityTrackerEntryHandle;
+
+import org.bukkit.World;
+import org.bukkit.entity.Entity;
 import org.bukkit.entity.Player;
 import org.bukkit.util.Vector;
 
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.logging.Level;
 
-public class MinecartMemberNetwork extends EntityNetworkController<CommonMinecart<?>> {
-    public static final double ROTATION_K = 0.55;
+public class MinecartMemberNetwork extends EntityNetworkController<CommonMinecart<?>> implements AttachmentModelOwner {
     public static final int ABSOLUTE_UPDATE_INTERVAL = 200;
     public static final double VELOCITY_SOUND_RADIUS = 16;
     public static final double VELOCITY_SOUND_RADIUS_SQUARED = VELOCITY_SOUND_RADIUS * VELOCITY_SOUND_RADIUS;
-    private static final Vector ZERO_VELOCITY = new Vector(0.0, 0.0, 0.0);
-    private final Set<Player> velocityUpdateReceivers = new HashSet<>();
 
-    public MinecartMemberNetwork() {
+    private MinecartMember<?> member = null;
+    private final Set<Player> velocityUpdateReceivers = new HashSet<>();
+    private final Map<Player, PassengerController> passengerControllers = new HashMap<Player, PassengerController>();
+
+    private CartAttachment rootAttachment;
+    private List<CartAttachmentSeat> seatAttachments = new ArrayList<CartAttachmentSeat>();
+
+    public MinecartMemberNetwork() {        
         final VectorAbstract velLiveBase = this.velLive;
         this.velLive = new VectorAbstract() {
             public double getX() {
@@ -54,17 +80,107 @@ public class MinecartMemberNetwork extends EntityNetworkController<CommonMinecar
                 return this;
             }
         };
+
+        //this.attachments.addAll(this.seats);
+
+        // Debug: add a test attachment
+        //this.attachments.add(new TestAttachment(this));
     }
 
-    private static int getAngleKFactor(int angle1, int angle2) {
-        int diff = angle1 - angle2;
-        while (diff <= -128) {
-            diff += 256;
+    private CartAttachment prepareRootAttachment() {
+        // Set attachment to a fallback if for whatever reason it is null
+        if (this.rootAttachment == null) {
+            this.onModelChanged(AttachmentModel.getDefaultModel(getMember().getEntity().getType()));
         }
-        while (diff > 128) {
-            diff -= 256;
+        // Return
+        return this.rootAttachment;
+    }
+
+    @Override
+    protected void onSyncPassengers(Player viewer, List<Entity> oldPassengers, List<Entity> newPassengers) {
+        // Clear passengers that have ejected
+        for (CartAttachmentSeat seat : this.seatAttachments) {
+            Entity oldPassenger = seat.getEntity();
+            if (!newPassengers.contains(oldPassenger)) {
+                seat.setEntity(null);
+            }
         }
-        return (int) (ROTATION_K * diff);
+
+        // Add passengers that have entered
+        for (Entity newPassenger : newPassengers) {
+            boolean hasSeat = false;
+            for (CartAttachmentSeat seat : this.seatAttachments) {
+                if (seat.getEntity() == newPassenger) {
+                    hasSeat = true;
+                    break;
+                }
+            }
+            if (!hasSeat) {
+                // Get the LAST known position
+                // We can not use current, because that is set to the location of the Minecart
+                Vector position = new Vector();
+                {
+                    EntityHandle handle = EntityHandle.fromBukkit(newPassenger);
+                    position.setX(handle.getLastX());
+                    position.setY(handle.getLastY());
+                    position.setZ(handle.getLastZ());
+                }
+
+                // Find a free seat and add the player there
+                List<CartAttachmentSeat> sortedSeats = this.getSeatsClosestTo(position);
+                for (CartAttachmentSeat seat : sortedSeats) {
+                    if (seat.getEntity() == null) {
+                        seat.setEntity(newPassenger);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    private List<CartAttachmentSeat> getSeatsClosestTo(Vector position) {
+        ArrayList<CartAttachmentSeat> result = new ArrayList<CartAttachmentSeat>(this.seatAttachments);
+        Collections.sort(result, new Comparator<CartAttachmentSeat>() {
+            @Override
+            public int compare(CartAttachmentSeat o1, CartAttachmentSeat o2) {
+                double d1 = o1.getPosition().distanceSquared(position);
+                double d2 = o2.getPosition().distanceSquared(position);
+                return Double.compare(d1, d2);
+            }
+        });
+        return result;
+    }
+
+    @Override
+    public void onAttached() {
+        super.onAttached();
+
+        this.getMember().getProperties().getModel().addOwner(this);
+    }
+
+    @Override
+    public void onDetached() {
+        super.onDetached();
+
+        if (this.rootAttachment != null) {
+            CartAttachment.deinitialize(this.rootAttachment);
+        }
+        if (this.member != null) {
+            this.member.getProperties().getModel().removeOwner(this);
+        }
+    }
+
+    public void setMember(MinecartMember<?> member) {
+        this.member = member;
+    }
+
+    public MinecartMember<?> getMember() {
+        if (this.entity == null) {
+            this.member = null;
+        } else if (this.member == null) {
+            this.member = this.entity.getController(MinecartMember.class);
+        }
+        return this.member;
     }
 
     private double convertVelocity(double velocity) {
@@ -72,8 +188,15 @@ public class MinecartMemberNetwork extends EntityNetworkController<CommonMinecar
     }
 
     private boolean isSoundEnabled() {
-        MinecartMember<?> member = (MinecartMember<?>) entity.getController();
-        return !(member == null || member.isUnloaded()) && member.getGroup().getProperties().isSoundEnabled();
+        MinecartMember<?> member = this.getMember();
+        if (member == null || member.isUnloaded()) {
+            return false;
+        }
+        MinecartGroup group = member.getGroup();
+        if (group == null) {
+            return false;
+        }
+        return group.getProperties().isSoundEnabled();
     }
 
     private void updateVelocity(Player player) {
@@ -82,69 +205,122 @@ public class MinecartMemberNetwork extends EntityNetworkController<CommonMinecar
             CommonPacket velocityPacket;
             if (inRange) {
                 // Send the current velocity
-                velocityPacket = getVelocityPacket(velSynched.getX(), velSynched.getY(), velSynched.getZ());
+                velocityPacket = getVelocityPacket(velSynched.length());
             } else {
                 // Clear velocity
-                velocityPacket = getVelocityPacket(0.0, 0.0, 0.0);
+                velocityPacket = getVelocityPacket(0.0);
             }
             // Send
             PacketUtil.sendPacket(player, velocityPacket);
         }
     }
 
-    @Override
-    public void makeHidden(Player player, boolean instant) {
-        super.makeHidden(player, instant);
-        this.velocityUpdateReceivers.remove(player);
-        PacketUtil.sendPacket(player, PacketType.OUT_ENTITY_VELOCITY.newInstance(getEntity().getEntityId(), ZERO_VELOCITY));
+    private CommonPacket getVelocityPacket(double velocity) {
+        return getVelocityPacket(velocity, 0.0, 0.0);
     }
 
     @Override
-    public void makeVisible(Player player) {
-        super.makeVisible(player);
-        this.velocityUpdateReceivers.add(player);
-        this.updateVelocity(player);
+    public void makeVisible(Player viewer) {
+        //super.makeVisible(viewer);
+
+        // If the entity backing this controller does not exist,
+        // remove this tracker entry from the server.
+        // It is not clear why this happens sometimes.
+        // Do this in another tick to avoid concurrent modification exceptions.
+        if (this.getMember() == null) {
+            World world = (this.entity == null) ? null : this.entity.getWorld();
+            if (world != null) {
+                CommonUtil.nextTick(new Runnable() {
+                    @Override
+                    public void run() {
+                        EntityTracker tracker = WorldUtil.getTracker(world);
+                        EntityTrackerEntryHandle entry = tracker.getEntry(entity.getEntity());
+                        if (entry != null && getHandle() == entry.getRaw()) {
+                            tracker.stopTracking(entity.getEntity());
+                        }
+                    }
+                });
+            }
+            return;
+        }
+
+        makeVisible(this.prepareRootAttachment(), viewer);
+
+        this.velocityUpdateReceivers.add(viewer);
+        this.updateVelocity(viewer);
+    }
+
+    private static void makeVisible(CartAttachment attachment, Player viewer) {
+        attachment.makeVisible(viewer);
+        for (CartAttachment child : attachment.children) {
+            makeVisible(child, viewer);
+        }
     }
 
     @Override
-    public void onSync() {
+    public void makeHidden(Player viewer, boolean instant) {
+        //super.makeHidden(viewer, instant);
+
+        if (this.rootAttachment != null) {
+            makeHidden(this.rootAttachment, viewer);
+        }
+
+        this.velocityUpdateReceivers.remove(viewer);
+        this.passengerControllers.remove(viewer);
+    }
+
+    private static void makeHidden(CartAttachment attachment, Player viewer) {
+        for (CartAttachment child : attachment.children) {
+            makeHidden(child, viewer);
+        }
+        attachment.makeHidden(viewer);
+    }
+
+    @Override
+    public void onTick() {
         try {
-            if (entity.isDead()) {
+            if (entity.isDead() || this.getMember() == null) {
                 return;
             }
-            MinecartMember<?> member = (MinecartMember<?>) entity.getController();
-            if (member.isUnloaded()) {
-                // Unloaded: Synchronize just this Minecart
-                super.onSync();
+
+            // If this minecart is unloaded, simply sync self only without any movement updates
+            if (this.getMember().isUnloaded()) {
+                this.syncSelf(false, false, false);
                 return;
-            } else if (member.getIndex() != 0) {
-                // Ignore
+            }
+
+            // When synchronizing the first member of the train, sync the entire train
+            MinecartGroup group = this.getMember().getGroup();
+            if (this.getMember() != group.head()) {
                 return;
             }
 
             // Update the entire group
             int i;
-            MinecartGroup group = member.getGroup();
             final int count = group.size();
             MinecartMemberNetwork[] networkControllers = new MinecartMemberNetwork[count];
             for (i = 0; i < count; i++) {
-                EntityNetworkController<?> controller = group.get(i).getEntity().getNetworkController();
+                MinecartMember<?> member = group.get(i);
+                EntityNetworkController<?> controller = member.getEntity().getNetworkController();
                 if (!(controller instanceof MinecartMemberNetwork)) {
                     // This is not good, but we can fix it...but not here
                     group.networkInvalid.set();
                     return;
                 }
                 networkControllers[i] = (MinecartMemberNetwork) controller;
+                if (networkControllers[i].member != member) {
+                    networkControllers[i].member = member;
+                }
+                networkControllers[i].tickSelf();
             }
 
             // Synchronize to the clients
             if (this.getTicksSinceLocationSync() > ABSOLUTE_UPDATE_INTERVAL) {
+                EntityTrackerEntryHandle.createHandle(this.getHandle()).setTimeSinceLocationSync(0);
+
                 // Perform absolute updates
-                for (MinecartMemberNetwork controller : networkControllers) {
-                    controller.syncLocationAbsolute();
-                    controller.syncVelocity();
-                    controller.syncMetaData();
-                    controller.getEntity().setPositionChanged(false);
+                for (i = 0; i < count; i++) {
+                    networkControllers[i].syncSelf(true, true, true);
                 }
             } else {
                 // Perform relative updates
@@ -152,7 +328,7 @@ public class MinecartMemberNetwork extends EntityNetworkController<CommonMinecar
                 if (!needsSync) {
                     for (i = 0; i < count; i++) {
                         MinecartMemberNetwork controller = networkControllers[i];
-                        if (controller.getEntity().isPositionChanged()) {
+                        if (controller.getEntity().isPositionChanged() || controller.getEntity().getDataWatcher().isChanged() || controller.isPassengersChanged()) {
                             needsSync = true;
                             break;
                         }
@@ -165,13 +341,13 @@ public class MinecartMemberNetwork extends EntityNetworkController<CommonMinecar
                     // Check whether changes are needed
                     for (i = 0; i < count; i++) {
                         MinecartMemberNetwork controller = networkControllers[i];
-                        moved |= controller.isPositionChanged(MIN_RELATIVE_CHANGE);
-                        rotated |= controller.isRotationChanged(MIN_RELATIVE_CHANGE);
+                        moved |= controller.isPositionChanged(MIN_RELATIVE_POS_CHANGE);
+                        rotated |= controller.isRotationChanged(MIN_RELATIVE_ROT_CHANGE);
                     }
 
                     // Perform actual updates
                     for (i = 0; i < count; i++) {
-                        networkControllers[i].syncSelf(group.get(i), moved, rotated);
+                        networkControllers[i].syncSelf(moved, rotated, false);
                     }
                 }
             }
@@ -181,45 +357,158 @@ public class MinecartMemberNetwork extends EntityNetworkController<CommonMinecar
         }
     }
 
-    public void syncSelf(MinecartMember<?> member, boolean moved, boolean rotated) {
-        // Read live location
-        int posX = locLive.getX();
-        int posY = locLive.getY();
-        int posZ = locLive.getZ();
-        int rotYaw = locLive.getYaw();
-        int rotPitch = locLive.getPitch();
-
-        // Synchronize location
-        if (rotated && !member.isDerailed()) {
-            // Update rotation with control system function
-            // This ensures that the Client animation doesn't glitch the rotation
-            rotYaw += getAngleKFactor(locLive.getYaw(), locSynched.getYaw());
-            rotPitch += getAngleKFactor(locLive.getPitch(), locSynched.getPitch());
+    /**
+     * Handles a player clicking on a virtual attachment part.
+     * Returns true if this minecart was indeed interacted with.
+     * Tracks the interaction that was performed so that it can later
+     * be deduced which attachment was interacted.
+     * 
+     * @param entityId
+     * @return True if interaction was handled
+     */
+    public boolean handleInteraction(int entityId) {
+        CartAttachment attachment = CartAttachment.findAttachment(this.rootAttachment, entityId);
+        if (attachment == null) {
+            return false;
         }
+
+        // TODO: Store this attachment for later querying
+        return true;
+    }
+
+    public void tickSelf() {
+        this.prepareRootAttachment();
+
+        try (Timings t = TCTimings.NETWORK_UPDATE_POSITIONS.start()) {
+            CartAttachment.updatePositions(this.rootAttachment, getLiveTransform());
+        }
+        try (Timings t = TCTimings.NETWORK_PERFORM_TICK.start()) {
+            CartAttachment.performTick(this.rootAttachment);
+        }
+    }
+
+    public void syncSelf(boolean moved, boolean rotated, boolean absolute) {
+        // Check
+        MinecartMember<?> member = this.getMember();
+        if (member == null) {
+            return;
+        }
+
         getEntity().setPositionChanged(false);
-        syncLocation(moved, rotated, posX, posY, posZ, rotYaw, rotPitch);
 
-        // Synchronize velocity
-        if (getEntity().isVelocityChanged() || isVelocityChanged(MIN_RELATIVE_VELOCITY)) {
-            // Reset dirty velocity
-            getEntity().setVelocityChanged(false);
+        this.locSynched.set(this.locLive);
 
-            // Send packets to recipients
-            velSynched.set(velLive);
-            CommonPacket velocityPacket = getVelocityPacket(velSynched.getX(), velSynched.getY(), velSynched.getZ());
-            for (Player player : velocityUpdateReceivers) {
-                PacketUtil.sendPacket(player, velocityPacket);
+        // Unused, but set it to false for unknown reasons!
+        getEntity().setVelocityChanged(false);
+
+        // Perform actual movement, which sends movement update packets
+        try (Timings t = TCTimings.NETWORK_PERFORM_MOVEMENT.start()) {
+            CartAttachment.performMovement(this.rootAttachment, absolute);
+        }
+
+        this.syncPassengers();
+    }
+
+    public Matrix4x4 getLiveTransform() {
+        // Combine translation and rotation information into a 4x4 matrix
+        MinecartMember<?> member = this.getMember();
+        Matrix4x4 transform = new Matrix4x4();
+        transform.translate(member.getWheels().getPosition());
+        transform.rotate(member.getOrientation());
+        transform.rotateZ(member.getRoll());
+        return transform;
+    }
+
+    public PassengerController getPassengerController(Player viewer) {
+        return getPassengerController(viewer, true);
+    }
+
+    public PassengerController getPassengerController(Player viewer, boolean createIfNotFound) {
+        PassengerController controller = this.passengerControllers.get(viewer);
+        if (controller == null && createIfNotFound) {
+            controller = new PassengerController(viewer);
+            this.passengerControllers.put(viewer, controller);
+        }
+        return controller;
+    }
+
+    public Collection<PassengerController> getPassengerControllers() {
+        return this.passengerControllers.values();
+    }
+
+    private void discoverSeats(CartAttachment attachment) {
+        if (attachment instanceof CartAttachmentSeat) {
+            this.seatAttachments.add((CartAttachmentSeat) attachment);
+        }
+        for (CartAttachment child : attachment.children) {
+            discoverSeats(child);
+        }
+    }
+
+    @Override
+    public void onModelChanged(AttachmentModel model) {
+        // Store the positions of the players in the previous seats
+        // This is used later to re-assign the passengers to seats when the model is changed
+        Map<Entity, Vector> oldSeatPositions = new HashMap<Entity, Vector>();
+        for (CartAttachmentSeat seat : this.seatAttachments) {
+            Entity oldEntity = seat.getEntity();
+            if (oldEntity != null) {
+                oldSeatPositions.put(oldEntity, seat.getPosition());
             }
         }
 
-        // Update the velocity update receivers
-        if (isSoundEnabled()) {
-            for (Player player : getViewers()) {
-                updateVelocity(player);
+        //TODO: Detect when only a single element is changed, and only update that element
+        // This allows for a cleaner update when repositioning/etc.
+
+        // Detach old attachments - after this viewers see nothing anymore
+        if (this.rootAttachment != null) {
+            for (Player oldViewer : this.getViewers()) {
+                makeHidden(this.rootAttachment, oldViewer);
+            }
+            CartAttachment.deinitialize(this.rootAttachment);
+            this.rootAttachment = null;
+        }
+
+        // Clear to reset passenger controllers
+        this.passengerControllers.clear();
+
+        // Attach new attachments - after this viewers see everything but passengers are not 'in'
+        this.rootAttachment = CartAttachment.initialize(this, model.getConfig());
+        
+        this.seatAttachments.clear();
+        this.discoverSeats(this.rootAttachment);
+
+        for (Player viewer : this.getViewers()) {
+            makeVisible(this.rootAttachment, viewer);
+        }
+
+        // Let all passengers re-enter us
+        // For this, we must find suitable Seat attachments in the tree
+        List<Entity> remainingPassengers = new ArrayList<Entity>(this.entity.getPassengers());
+        while (!remainingPassengers.isEmpty()) {
+            Entity entity = remainingPassengers.get(0);
+            Vector position = oldSeatPositions.get(entity);
+            if (position == null) {
+                position = entity.getLocation().toVector();
+            }
+            boolean foundSeat = false;
+            List<CartAttachmentSeat> seats = this.getSeatsClosestTo(position);
+            for (CartAttachmentSeat seat : seats) {
+                if (seat.getEntity() == null) {
+                    seat.setEntity(entity);
+                    remainingPassengers.remove(0);
+                    foundSeat = true;
+                    break;
+                }
+            }
+            if (!foundSeat) {
+                break;
             }
         }
 
-        // Synchronize meta data
-        syncMetaData();
+        // It can happen passengers have no seat now. Eject them.
+        //TODO!
+        
+        //model.log();
     }
 }

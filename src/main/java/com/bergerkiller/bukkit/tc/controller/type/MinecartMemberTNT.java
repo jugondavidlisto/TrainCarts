@@ -13,11 +13,11 @@ public class MinecartMemberTNT extends MinecartMember<CommonMinecartTNT> {
     private boolean ignoreDamage = false;
 
     @Override
-    public void onDamage(DamageSource damagesource, double damage) {
+    public boolean onDamage(DamageSource damagesource, double damage) {
         if (!this.isInteractable() || ignoreDamage) {
-            return;
+            return false;
         }
-        super.onDamage(damagesource, damage);
+        boolean result = super.onDamage(damagesource, damage);
         // If entity died and the source of the damage is 'igniting' the TNT, explode
         // Also explode if the TNT minecart is moving really fast
         if (entity.isDead() && !Util.canInstantlyBuild(damagesource.getEntity()) &&
@@ -28,6 +28,7 @@ public class MinecartMemberTNT extends MinecartMember<CommonMinecartTNT> {
             // Entity explosion MAY have been cancelled, re-enable for the future
             ignoreDamage = false;
         }
+        return result;
     }
 
     @Override
@@ -39,8 +40,8 @@ public class MinecartMemberTNT extends MinecartMember<CommonMinecartTNT> {
     }
 
     @Override
-    public void onPhysicsPostMove(double speedFactor) throws MemberMissingException, GroupUnloadedException {
-        super.onPhysicsPostMove(speedFactor);
+    public void onPhysicsPostMove() throws MemberMissingException, GroupUnloadedException {
+        super.onPhysicsPostMove();
         int ticks = entity.getFuseTicks();
         if (ticks > 0) {
             // Update fuse ticks and show fuse effect

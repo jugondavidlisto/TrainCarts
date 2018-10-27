@@ -2,6 +2,8 @@ package com.bergerkiller.bukkit.tc.controller.components;
 
 import com.bergerkiller.bukkit.tc.actions.*;
 import com.bergerkiller.bukkit.tc.controller.MinecartMember;
+import com.bergerkiller.bukkit.tc.utils.LauncherConfig;
+
 import org.bukkit.Location;
 import org.bukkit.block.BlockFace;
 import org.bukkit.util.Vector;
@@ -29,7 +31,9 @@ public class ActionTrackerMember extends ActionTracker {
     @Override
     public void clear() {
         super.clear();
-        owner.getGroup().getActions().removeActions(owner);
+        if (!owner.isUnloaded()) {
+            owner.getGroup().getActions().removeActions(owner);
+        }
     }
 
     @Override
@@ -64,7 +68,39 @@ public class ActionTrackerMember extends ActionTracker {
     }
 
     public MemberActionLaunch addActionLaunch(double distance, double targetvelocity) {
-        return addGroupAction(new MemberActionLaunch(distance, targetvelocity));
+        MemberActionLaunch action = new MemberActionLaunch();
+        action.initDistance(distance, targetvelocity);
+        return addGroupAction(action);
+    }
+
+    public MemberActionLaunch addActionTimedLaunch(int timeTicks, double targetvelocity) {
+        MemberActionLaunch action = new MemberActionLaunch();
+        action.initTime(timeTicks, targetvelocity);
+        return addGroupAction(action);
+    }
+
+    public MemberActionLaunch addActionLaunch(LauncherConfig config, double targetvelocity) {
+        MemberActionLaunch action = new MemberActionLaunch();
+        action.init(config, targetvelocity);
+        return addGroupAction(action);
+    }
+
+    public MemberActionLaunchDirection addActionLaunch(final BlockFace direction, double targetdistance, double targetvelocity) {
+        MemberActionLaunchDirection action = new MemberActionLaunchDirection();
+        action.initDistance(targetdistance, targetvelocity, direction);
+        return addGroupAction(action);
+    }
+
+    public MemberActionLaunchDirection addActionTimedLaunch(final BlockFace direction, int timeTicks, double targetvelocity) {
+        MemberActionLaunchDirection action = new MemberActionLaunchDirection();
+        action.initTime(timeTicks, targetvelocity, direction);
+        return addGroupAction(action);
+    }
+
+    public MemberActionLaunchDirection addActionLaunch(final BlockFace direction, LauncherConfig config, double targetvelocity) {
+        MemberActionLaunchDirection action = new MemberActionLaunchDirection();
+        action.init(config, targetvelocity, direction);
+        return addGroupAction(action);
     }
 
     public MemberActionLaunchLocation addActionLaunch(Location destination, double targetvelocity) {
@@ -75,11 +111,11 @@ public class ActionTrackerMember extends ActionTracker {
         return addActionLaunch(owner.getEntity().getLocation().add(offset), targetvelocity);
     }
 
-    public MemberActionLaunchDirection addActionLaunch(final BlockFace direction, double targetdistance, double targetvelocity) {
-        return addGroupAction(new MemberActionLaunchDirection(targetdistance, targetvelocity, direction));
+    public MemberActionWaitOccupied addActionWaitOccupied(double maxDistance, long launchDelay, double launchDistance) {
+        return addActionWaitOccupied(maxDistance, launchDelay, launchDistance, null, null);
     }
 
-    public MemberActionWaitOccupied addActionWaitOccupied(int maxsize, long launchDelay, double launchDistance) {
-        return addGroupAction(new MemberActionWaitOccupied(maxsize, launchDelay, launchDistance));
+    public MemberActionWaitOccupied addActionWaitOccupied(double maxDistance, long launchDelay, double launchDistance, BlockFace launchDirection, Double launchVelocity) { // Use Double to allow null
+        return addGroupAction(new MemberActionWaitOccupied(maxDistance, launchDelay, launchDistance, launchDirection, launchVelocity));
     }
 }

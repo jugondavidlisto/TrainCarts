@@ -13,6 +13,7 @@ import org.bukkit.entity.Player;
 
 import java.util.Collection;
 import java.util.List;
+import java.util.Locale;
 
 public class SignActionEnter extends SignAction {
 
@@ -49,7 +50,7 @@ public class SignActionEnter extends SignAction {
         double radiusXZ = ParseUtil.parseDouble(info.getLine(1), 2.0);
         double radiusY = 1.0;
         // Radius cylindrical or spherical?
-        if (info.getLine(1).toLowerCase().endsWith("s")) {
+        if (info.getLine(1).toLowerCase(Locale.ENGLISH).endsWith("s")) {
             // Spherical
             radiusY = radiusXZ;
         }
@@ -57,7 +58,7 @@ public class SignActionEnter extends SignAction {
         boolean enterPlayers = false;
         boolean enterMobs = false;
         if (!info.getLine(2).isEmpty()) {
-            String mode = info.getLine(2).toLowerCase();
+            String mode = info.getLine(2).toLowerCase(Locale.ENGLISH);
             if (mode.contains("mob")) {
                 enterMobs = true;
             }
@@ -84,9 +85,7 @@ public class SignActionEnter extends SignAction {
                 if (canEnter(entity, enterPlayers, enterMobs)) {
                     // Look for an Empty minecart to put him in
                     for (MinecartMember<?> member : members) {
-                        if (!member.getEntity().hasPassenger()) {
-                            // Move Entity to this Minecart and finish
-                            member.getEntity().setPassenger(entity);
+                        if (member.getAvailableSeatCount() > 0 && member.getEntity().addPassenger(entity)) {
                             break;
                         }
                     }
@@ -98,23 +97,35 @@ public class SignActionEnter extends SignAction {
             double distance;
             Entity selectedEntity;
             for (MinecartMember<?> member : members) {
+                if (member.getAvailableSeatCount() == 0) {
+                    continue;
+                }
+
                 List<Entity> nearby = member.getEntity().getNearbyEntities(radiusXZ, radiusY, radiusXZ);
-                lastDistance = Double.MAX_VALUE;
-                selectedEntity = null;
-                for (Entity entity : nearby) {
-                    if (entity.getVehicle() != null || !canEnter(entity, enterPlayers, enterMobs)) {
-                        continue;
+                while (!nearby.isEmpty() && member.getAvailableSeatCount() > 0) {
+                    lastDistance = Double.MAX_VALUE;
+                    selectedEntity = null;
+                    for (Entity entity : nearby) {
+                        if (entity.getVehicle() != null || !canEnter(entity, enterPlayers, enterMobs)) {
+                            continue;
+                        }
+                        distance = member.getEntity().loc.distanceSquared(entity);
+                        if (distance < lastDistance) {
+                            lastDistance = distance;
+                            selectedEntity = entity;
+                        }
                     }
-                    distance = member.getEntity().loc.distanceSquared(entity);
-                    if (distance < lastDistance) {
-                        lastDistance = distance;
-                        selectedEntity = entity;
+
+                    // Try to enter
+                    if (selectedEntity != null) {
+                        nearby.remove(selectedEntity);
+                        member.getEntity().addPassenger(selectedEntity);
+                    } else {
+                        break;
                     }
                 }
-                // Try to enter
-                if (selectedEntity != null) {
-                    member.getEntity().setPassenger(selectedEntity);
-                }
+                
+
             }
         }
     }
@@ -126,6 +137,6 @@ public class SignActionEnter extends SignAction {
 
     @Override
     public boolean build(SignChangeActionEvent event) {
-        return event.getMode() != SignActionMode.NONE && handleBuild(event, Permission.BUILD_ENTER, "train enter sign", "cause nearby players/mobs to enter the train");
+        return handleBuild(event, Permission.BUILD_ENTER, "train enter sign", "cause nearby players/mobs to enter the train");
     }
 }

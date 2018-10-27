@@ -1,11 +1,12 @@
 package com.bergerkiller.bukkit.tc.rails.logic;
 
 import com.bergerkiller.bukkit.common.bases.IntVector3;
-import com.bergerkiller.bukkit.common.entity.type.CommonMinecart;
 import com.bergerkiller.bukkit.common.utils.FaceUtil;
 import com.bergerkiller.bukkit.common.utils.LogicUtil;
 import com.bergerkiller.bukkit.common.utils.MathUtil;
-import com.bergerkiller.bukkit.tc.controller.MinecartMember;
+import com.bergerkiller.bukkit.tc.controller.components.RailPath;
+import com.bergerkiller.bukkit.tc.controller.components.RailState;
+
 import org.bukkit.block.BlockFace;
 import org.bukkit.util.Vector;
 
@@ -14,19 +15,39 @@ import org.bukkit.util.Vector;
  */
 public class RailLogicHorizontal extends RailLogic {
     private static final RailLogicHorizontal[] values = new RailLogicHorizontal[8];
+    private static final RailLogicHorizontal[] values_upsidedown = new RailLogicHorizontal[8];
 
     static {
         for (int i = 0; i < 8; i++) {
-            values[i] = new RailLogicHorizontal(FaceUtil.notchToFace(i));
+            values[i] = new RailLogicHorizontal(FaceUtil.notchToFace(i), false);
+            values_upsidedown[i] = new RailLogicHorizontal(FaceUtil.notchToFace(i), true);
         }
     }
 
-    private final double dx, dz;
-    private final double startX, startZ;
+    private final boolean upside_down;
+    protected final double dx, dz;
+    protected final double startX, startZ;
+    private final BlockFace horizontalCartDir;
+    private final BlockFace[] cartFaces;
     private final BlockFace[] faces;
+    private final BlockFace[] ends;
+    public static final double Y_POS_OFFSET = 0.0625;
+    public static final double Y_POS_OFFSET_UPSIDEDOWN = -Y_POS_OFFSET;
+    public static final double Y_POS_OFFSET_UPSIDEDOWN_SLOPE = -0.2;
 
     protected RailLogicHorizontal(BlockFace direction) {
+        this(direction, false);
+    }
+
+    protected RailLogicHorizontal(BlockFace direction, boolean upsideDown) {
         super(direction);
+        this.horizontalCartDir = FaceUtil.getRailsCartDirection(direction);
+        // Train drives on this horizontal rails upside-down
+        this.upside_down = upsideDown;
+        // Motion faces for the rails cart direction
+        this.cartFaces = FaceUtil.getFaces(this.getCartDirection());
+        // The ends of the rail, where the rail can be connected to other rails
+        this.ends = FaceUtil.getFaces(direction.getOppositeFace());
         // Fix north/west, they are non-existent
         direction = FaceUtil.toRailsDirection(direction);
         // Faces and direction
@@ -44,12 +65,21 @@ public class RailLogicHorizontal extends RailLogic {
         final double startFactor = MathUtil.invert(0.5, !this.curved);
         this.startX = startFactor * faces[0].getModX();
         this.startZ = startFactor * faces[0].getModZ();
-        // Invert north and south (is for some reason needed)
+        // Invert all north and south (is for some reason needed)
         for (int i = 0; i < this.faces.length; i++) {
             if (this.faces[i] == BlockFace.NORTH || this.faces[i] == BlockFace.SOUTH) {
                 this.faces[i] = this.faces[i].getOppositeFace();
             }
         }
+    }
+
+    /**
+     * Gets the motion vector along which minecarts move according to this RailLogic
+     * 
+     * @return motion vector
+     */
+    public BlockFace getCartDirection() {
+        return this.horizontalCartDir;
     }
 
     /**
@@ -62,130 +92,117 @@ public class RailLogicHorizontal extends RailLogic {
         return values[FaceUtil.faceToNotch(direction)];
     }
 
-    @Override
-    public Vector getFixedPosition(CommonMinecart<?> entity, double x, double y, double z, IntVector3 railPos) {
-        double newLocX = railPos.midX() + this.startX;
-        double newLocY = railPos.midY() - 0.69;
-        double newLocZ = railPos.midZ() + this.startZ;
-        if (this.alongZ) {
-            // Moving along the X-axis
-            newLocZ += this.dz * (entity.loc.getZ() - railPos.z);
-        } else if (this.alongX) {
-            // Moving along the Z-axis
-            newLocX += this.dx * (entity.loc.getX() - railPos.x);
+    /**
+     * Gets the horizontal rail logic to go into the direction specified
+     *
+     * @param direction to go to
+     * @param upsideDown whether the Minecart drives on the rail upside-down
+     * @return Horizontal rail logic for that direction
+     */
+    public static RailLogicHorizontal get(BlockFace direction, boolean upsideDown) {
+        if (upsideDown) {
+            return values_upsidedown[FaceUtil.faceToNotch(direction)];
         } else {
-            // Curve
-            double factor = 2.0 * (this.dx * (entity.loc.getX() - newLocX) + this.dz * (entity.loc.getZ() - newLocZ));
-            newLocX += factor * this.dx;
-            newLocZ += factor * this.dz;
+            return values[FaceUtil.faceToNotch(direction)];
         }
-        // Calculate the Y-position
-        return new Vector(newLocX, newLocY, newLocZ);
     }
 
     @Override
-    public BlockFace getMovementDirection(MinecartMember<?> member, Vector movement) {
-        final BlockFace raildirection = this.getDirection();
-        final boolean isHorizontalMovement = Math.abs(movement.getX()) >= 0.0001 || Math.abs(movement.getZ()) >= 0.0001;
-        BlockFace direction;
+    protected RailPath createPath() {
+        double base_y = isUpsideDown() ? Y_POS_OFFSET_UPSIDEDOWN : Y_POS_OFFSET;
+        Vector p1 = new Vector(this.startX + 0.5, base_y, this.startZ + 0.5);
+        Vector p2 = p1.clone();
+        if (this.alongZ) {
+            p2.setZ(p2.getZ() + this.dz);
+        } else if (this.alongX) {
+            p2.setX(p2.getX() + this.dx);
+        } else {
+            p2.setX(p2.getX() - this.dx);
+            p2.setZ(p2.getZ() - this.dz);
+        }
+        getFixedPosition(p1, IntVector3.ZERO);
+        getFixedPosition(p2, IntVector3.ZERO);
+        return new RailPath.Builder()
+                .up(this.isUpsideDown() ? BlockFace.DOWN : BlockFace.UP)
+                .add(p1).add(p2).build();
+    }
 
+    /**
+     * Gets whether this Rail Logic drives the train horizontally upside-down
+     * 
+     * @return True if upside-down
+     */
+    public boolean isUpsideDown() {
+        return upside_down;
+    }
+
+    /**
+     * <b>Deprecated: was used before the introduction of Rail Paths. This is here
+     * for backwards compatibility with plugins like TC Hangrail</b><br><br>
+     * 
+     * Gets the position of the Minecart when snapped to the rails. The input
+     * position vector is adjusted, with the result written into the same vector.
+     * This is only used once when creating the path for this rail logic.
+     * 
+     * @param position input and result output
+     * @param railPos of the rails using this logic
+     */
+    @Deprecated
+    public void getFixedPosition(Vector position, IntVector3 railPos) {
+        //nop
+    }
+
+    @Override
+    public void onPathAdjust(RailState state) {
+        // When coming in from the side, set motion to move down the slope
+        if (this.isSloped()) {
+            BlockFace enterFaceRot = state.enterFace();
+            if (enterFaceRot == FaceUtil.rotate(this.horizontalCartDir, 2) ||
+                enterFaceRot == FaceUtil.rotate(this.horizontalCartDir, -2))
+            {
+                state.position().setMotion(this.horizontalCartDir.getOppositeFace());
+            }
+        }
+    }
+
+    @Override
+    public BlockFace getMovementDirection(BlockFace endDirection) {
+        final BlockFace raildirection = this.getDirection();
+        BlockFace direction;
         if (this.isSloped()) {
             // Sloped rail logic
-            if (isHorizontalMovement) {
-                // Deal with minecarts moving on straight slopes
-                float moveYaw = MathUtil.getLookAtYaw(movement);
-                float diff1 = MathUtil.getAngleDifference(moveYaw, FaceUtil.faceToYaw(raildirection));
-                float diff2 = MathUtil.getAngleDifference(moveYaw, FaceUtil.faceToYaw(raildirection.getOppositeFace()));
-                // Compare with the previous direction to sort out equality problems
-                if (diff1 == diff2) {
-                    diff1 = FaceUtil.getFaceYawDifference(member.getDirectionFrom(), raildirection);
-                    diff2 = FaceUtil.getFaceYawDifference(member.getDirectionFrom(), raildirection.getOppositeFace());
-                }
-                // Use the opposite direction if needed
-                if (diff1 > diff2) {
-                    direction = raildirection.getOppositeFace();
-                } else {
-                    direction = raildirection;
-                }
+            // When moving in the direction of a slope, or up, go up the slope
+            // In all other cases, go down the slope
+            if (endDirection == raildirection || endDirection == BlockFace.UP) {
+                direction = raildirection; // up the slope
             } else {
-                // Deal with vertically moving or standing still minecarts on slopes
-                if (Math.abs(movement.getY()) > 0.0001) {
-                    // Going from vertical to a slope
-                    if (movement.getY() > 0.0) {
-                        direction = raildirection;
-                    } else {
-                        direction = raildirection.getOppositeFace();
-                    }
-                } else {
-                    // Gravity sends it down the slope at some point
-                    direction = raildirection.getOppositeFace();
-                }
+                direction = raildirection.getOppositeFace(); // down the slope
             }
         } else if (this.curved) {
             // Curved rail logic
-            BlockFace movementDir = FaceUtil.getDirection(movement);
-            BlockFace[] possibleDirections = FaceUtil.getFaces(raildirection.getOppositeFace());
-            if (FaceUtil.isSubCardinal(movementDir)) {
-                direction = movementDir;
+            // When moving in the same direction as an end, go to that end
+            // When moving in the opposite direction of an end, pick the other end
+            BlockFace targetFace;
+            if (endDirection == this.ends[0] || endDirection == this.ends[1].getOppositeFace()) {
+                targetFace = this.ends[0];
             } else {
-                // Evaluate ingoing/outgoing faces with direction
-                BlockFace directionTo;
-                if (possibleDirections[0] == movementDir) {
-                    // Move towards 0
-                    directionTo = possibleDirections[0];
-                } else if (possibleDirections[1] == movementDir) {
-                    // Move towards 1
-                    directionTo = possibleDirections[1];
-                } else if (possibleDirections[0].getOppositeFace() == movementDir) {
-                    // Move into 0, towards 1
-                    directionTo = possibleDirections[1];
-                } else if (possibleDirections[1].getOppositeFace() == movementDir) {
-                    // Move into 1, towards 0
-                    directionTo = possibleDirections[0];
-                } else {
-                    // Unknown, fallback
-                    directionTo = movementDir;
-                }
-                // Calculate the movement direction from the 'to' direction
-                direction = FaceUtil.getRailsCartDirection(raildirection);
-                if (!LogicUtil.contains(directionTo, FaceUtil.getFaces(direction))) {
-                    direction = direction.getOppositeFace();
-                }
+                targetFace = this.ends[1];
+            }
+
+            direction = this.getCartDirection();
+            if (!LogicUtil.contains(targetFace, this.cartFaces)) {
+                direction = direction.getOppositeFace();
             }
         } else {
             // Straight rail logic
-            // Find the right direction by tracking two 180-degree hemispheres
-            float angleSide1 = FaceUtil.faceToYaw(raildirection);
-            float angleSide2 = FaceUtil.faceToYaw(raildirection.getOppositeFace());
-            float movAngle = MathUtil.getLookAtYaw(movement);
-            if (MathUtil.getAngleDifference(angleSide1, movAngle) < MathUtil.getAngleDifference(angleSide2, movAngle)) {
-                direction = raildirection;
-            } else {
+            // Go in the direction of the rail, unless the opposite direction is chosen
+            // This logic fulfills the 'south-east' rule
+            if (endDirection == raildirection.getOppositeFace()) {
                 direction = raildirection.getOppositeFace();
+            } else {
+                direction = raildirection;
             }
         }
         return direction;
-    }
-
-    @Override
-    public void onPreMove(MinecartMember<?> member) {
-        final CommonMinecart<?> entity = member.getEntity();
-        // Apply velocity modifiers
-        final boolean invert;
-        if (this.curved) {
-            // Invert only if heading towards the exit-direction of the curve
-            BlockFace from = member.getDirectionTo();
-            invert = from == this.faces[0] || from == this.faces[1];
-        } else {
-            // Invert only if the direction is inverted relative to cart velocity
-            invert = (entity.vel.getX() * this.dx + entity.vel.getZ() * this.dz) < 0.0;
-        }
-        final double railFactor = MathUtil.invert(MathUtil.normalize(this.dx, this.dz, entity.vel.getX(), entity.vel.getZ()), invert);
-        entity.vel.set(railFactor * this.dx, 0.0, railFactor * this.dz);
-
-        // Adjust position of Entity on rail
-        IntVector3 railPos = member.getBlockPos();
-        entity.loc.set(getFixedPosition(entity, entity.loc.getX(), entity.loc.getY(), entity.loc.getZ(), railPos));
-        entity.loc.y.add((double) entity.getHeight() - 0.5);
     }
 }

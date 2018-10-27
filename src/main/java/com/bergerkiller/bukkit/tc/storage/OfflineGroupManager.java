@@ -2,14 +2,18 @@ package com.bergerkiller.bukkit.tc.storage;
 
 import com.bergerkiller.bukkit.common.config.DataReader;
 import com.bergerkiller.bukkit.common.config.DataWriter;
+import com.bergerkiller.bukkit.common.utils.EntityUtil;
 import com.bergerkiller.bukkit.common.utils.MathUtil;
 import com.bergerkiller.bukkit.common.utils.StreamUtil;
 import com.bergerkiller.bukkit.common.utils.WorldUtil;
 import com.bergerkiller.bukkit.common.wrappers.LongHashSet.LongIterator;
+import com.bergerkiller.bukkit.tc.TCConfig;
 import com.bergerkiller.bukkit.tc.TrainCarts;
+import com.bergerkiller.bukkit.tc.Util;
 import com.bergerkiller.bukkit.tc.controller.MinecartGroup;
-import com.bergerkiller.bukkit.tc.controller.MinecartMember;
 import com.bergerkiller.bukkit.tc.properties.TrainProperties;
+
+import org.bukkit.Bukkit;
 import org.bukkit.Chunk;
 import org.bukkit.World;
 import org.bukkit.entity.Entity;
@@ -23,12 +27,31 @@ import java.util.logging.Level;
 
 public class OfflineGroupManager {
     public static Long lastUnloadChunk = null;
+    private static World destroyAllCurrentWorld = null;
     private static boolean chunkLoadReq = false;
     private static boolean isRefreshingGroups = false;
-    private static Set<String> containedTrains = new HashSet<>();
+    private static Map<String, OfflineGroup> containedTrains = new HashMap<>();
     private static HashSet<UUID> containedMinecarts = new HashSet<>();
     private static final Map<UUID, OfflineGroupManager> managers = new HashMap<>();
-    private OfflineGroupMap groupmap = new OfflineGroupMap();
+    private OfflineGroupMap groupmap = new OfflineGroupMap() {
+        @Override
+        public void add(OfflineGroup group) {
+            super.add(group);
+            containedTrains.put(group.name, group);
+            for (OfflineMember member : group.members) {
+                containedMinecarts.add(member.entityUID);
+            }
+        }
+
+        @Override
+        public void remove(OfflineGroup group) {
+            super.remove(group);
+            containedTrains.remove(group.name);
+            for (OfflineMember member : group.members) {
+                containedMinecarts.remove(member.entityUID);
+            }
+        }
+    };
 
     public static OfflineGroupManager get(UUID uuid) {
         OfflineGroupManager rval = managers.get(uuid);
@@ -55,7 +78,7 @@ public class OfflineGroupManager {
                 if (man.groupmap.isEmpty()) {
                     managers.remove(chunk.getWorld().getUID());
                 } else {
-                    Set<OfflineGroup> groups = man.groupmap.remove(chunk);
+                    Set<OfflineGroup> groups = man.groupmap.removeFromChunk(chunk);
                     if (groups != null) {
                         for (OfflineGroup group : groups) {
                             if (group.testFullyLoaded()) {
@@ -81,7 +104,7 @@ public class OfflineGroupManager {
                 if (man.groupmap.isEmpty()) {
                     managers.remove(chunk.getWorld().getUID());
                 } else {
-                    Set<OfflineGroup> groupset = man.groupmap.get(chunk);
+                    Set<OfflineGroup> groupset = man.groupmap.getFromChunk(chunk);
                     if (groupset != null) {
                         for (OfflineGroup group : groupset) {
                             group.loadedChunks.remove(MathUtil.longHashToLong(chunk.getX(), chunk.getZ()));
@@ -128,7 +151,7 @@ public class OfflineGroupManager {
         if (!TrainProperties.get(group.name).isKeepingChunksLoaded()) {
             return false;
         }
-        if (TrainCarts.keepChunksLoadedOnlyWhenMoving && !group.isMoving()) {
+        if (TCConfig.keepChunksLoadedOnlyWhenMoving && !group.isMoving()) {
             return false;
         }
         // Load nearby chunks
@@ -145,13 +168,27 @@ public class OfflineGroupManager {
      * Train removal
      */
     public static int destroyAll(World world) {
+        try {
+            destroyAllCurrentWorld = world;
+            return destroyAll_impl(world);
+        } finally {
+            destroyAllCurrentWorld = null;
+        }
+    }
+
+    public static boolean isDestroyingAllInWorld(World world) {
+        return destroyAllCurrentWorld == world;
+    }
+
+    private static int destroyAll_impl(World world) {
         // Ignore worlds that are disabled
         if (TrainCarts.isWorldDisabled(world)) {
             return 0;
         }
         int count = 0;
-        // Remove groups
-        for (MinecartGroup g : MinecartGroup.getGroups()) {
+
+        // Remove loaded groups
+        for (MinecartGroup g : MinecartGroup.getGroups().cloneAsIterable()) {
             if (g.getWorld() == world) {
                 if (!g.isEmpty()) {
                     count++;
@@ -159,7 +196,8 @@ public class OfflineGroupManager {
                 g.destroy();
             }
         }
-        // Remove remaining offline groups
+
+        // Remove remaining offline groups and their minecart entities
         synchronized (managers) {
             OfflineGroupManager man = managers.remove(world.getUID());
             if (man != null) {
@@ -169,18 +207,17 @@ public class OfflineGroupManager {
                     TrainProperties.remove(wg.name);
                     for (OfflineMember wm : wg.members) {
                         containedMinecarts.remove(wm.entityUID);
-                        // Load the chunk this minecart is in and remove it
-                        // We already de-linked the group map, so no worry for replacements
-                        Chunk chunk = world.getChunkAt(wm.cx, wm.cz);
-                        for (Entity next : WorldUtil.getEntities(chunk)) {
-                            if (next.getUniqueId().equals(wm.entityUID)) {
-                                next.remove();
-                            }
+
+                        // Find the Minecart, mark chunk dirty if found (removing)
+                        Minecart entity = wm.findEntity(world, true);
+                        if (entity != null) {
+                            entity.remove();
                         }
                     }
                 }
             }
         }
+
         // Remove (bugged) Minecarts
         destroyMinecarts(world);
         removeBuggedMinecarts(world);
@@ -190,26 +227,36 @@ public class OfflineGroupManager {
     public static int destroyAll() {
         // The below three storage points can be safely cleared
         // Disabled worlds don't store anything in them anyway
-        TrainProperties.clearAll();
-        containedTrains.clear();
-        containedMinecarts.clear();
         int count = 0;
         for (World world : WorldUtil.getWorlds()) {
             count += destroyAll(world);
+        }
+
+        TrainProperties.clearAll();
+        containedTrains.clear();
+        containedMinecarts.clear();
+        synchronized (managers) {
+            managers.clear();
         }
         return count;
     }
 
     private static void destroyMinecarts(World world) {
-        for (Entity e : WorldUtil.getEntities(world)) {
-            if (e instanceof Minecart) {
-                e.remove();
+        for (Chunk chunk : WorldUtil.getChunks(world)) {
+            for (Entity e : chunk.getEntities()) {
+                if (e instanceof Minecart && !e.isDead()) {
+                    e.remove();
+                    Util.markChunkDirty(chunk);
+                }
             }
         }
-        for (Chunk chunk : WorldUtil.getChunks(world)) {
-            for (Entity e : WorldUtil.getEntities(chunk)) {
-                if (e instanceof Minecart) {
-                    e.remove();
+        for (Entity e : world.getEntities()) {
+            if (e instanceof Minecart && !e.isDead()) {
+                e.remove();
+
+                Chunk chunk = WorldUtil.getChunk(world, EntityUtil.getChunkX(e), EntityUtil.getChunkZ(e));
+                if (chunk != null) {
+                    Util.markChunkDirty(chunk);
                 }
             }
         }
@@ -271,14 +318,10 @@ public class OfflineGroupManager {
                             wg.worldUUID = worldUID;
 
                             // Register the new offline group within (this) Manager
-                            for (OfflineMember wm : wg.members) {
-                                containedMinecarts.add(wm.entityUID);
-                            }
                             man.groupmap.add(wg);
-                            containedTrains.add(wg.name);
                             totalmembers += wg.members.length;
+                            totalgroups++;
                         }
-                        totalgroups += groupcount;
                     }
                     String msg = totalgroups + " Train";
                     if (totalgroups == 1) msg += " has";
@@ -338,13 +381,9 @@ public class OfflineGroupManager {
             return;
         }
         synchronized (managers) {
-            for (MinecartMember<?> mm : group) {
-                containedMinecarts.add(mm.getEntity().getUniqueId());
-            }
             OfflineGroup wg = new OfflineGroup(group);
             wg.updateLoadedChunks(world);
             get(world).groupmap.add(wg);
-            containedTrains.add(wg.name);
         }
     }
 
@@ -362,8 +401,25 @@ public class OfflineGroupManager {
         return containedTrains.size();
     }
 
+    public static int getStoredCountInLoadedWorlds() {
+        int count = 0;
+        synchronized (managers) {
+            for (Map.Entry<UUID, OfflineGroupManager> entry : managers.entrySet()) {
+                if (Bukkit.getWorld(entry.getKey()) != null) {
+                    count += entry.getValue().groupmap.size();
+                }
+            }
+        }
+        return count;
+    }
+
     public static boolean contains(String trainname) {
-        return containedTrains.contains(trainname);
+        return containedTrains.containsKey(trainname);
+    }
+
+    public static boolean containsInLoadedWorld(String trainname) {
+        OfflineGroup offlineGroup = containedTrains.get(trainname);
+        return offlineGroup != null && Bukkit.getWorld(offlineGroup.worldUUID) != null;
     }
 
     public static void rename(String oldtrainname, String newtrainname) {
@@ -373,7 +429,7 @@ public class OfflineGroupManager {
                     if (group.name.equals(oldtrainname)) {
                         group.name = newtrainname;
                         containedTrains.remove(oldtrainname);
-                        containedTrains.add(newtrainname);
+                        containedTrains.put(newtrainname, group);
                         return;
                     }
                 }
@@ -395,13 +451,9 @@ public class OfflineGroupManager {
 
     public static void removeGroup(String groupName) {
         synchronized (managers) {
-            containedTrains.remove(groupName);
             for (OfflineGroupManager manager : managers.values()) {
                 OfflineGroup group = manager.groupmap.remove(groupName);
                 if (group != null) {
-                    for (OfflineMember member : group.members) {
-                        containedMinecarts.remove(member.entityUID);
-                    }
                     break;
                 }
             }
@@ -460,11 +512,7 @@ public class OfflineGroupManager {
     }
 
     private void restoreGroup(OfflineGroup group, World world) {
-        containedTrains.remove(group.name);
         groupmap.remove(group);
-        for (OfflineMember wm : group.members) {
-            containedMinecarts.remove(wm.entityUID);
-        }
         group.create(world);
     }
 }

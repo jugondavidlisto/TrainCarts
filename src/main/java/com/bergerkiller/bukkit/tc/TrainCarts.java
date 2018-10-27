@@ -2,28 +2,38 @@ package com.bergerkiller.bukkit.tc;
 
 import com.bergerkiller.bukkit.common.Common;
 import com.bergerkiller.bukkit.common.PluginBase;
-import com.bergerkiller.bukkit.common.StringReplaceBundle;
 import com.bergerkiller.bukkit.common.Task;
-import com.bergerkiller.bukkit.common.config.ConfigurationNode;
 import com.bergerkiller.bukkit.common.config.FileConfiguration;
-import com.bergerkiller.bukkit.common.conversion.Conversion;
 import com.bergerkiller.bukkit.common.inventory.ItemParser;
+import com.bergerkiller.bukkit.common.protocol.PacketListener;
+import com.bergerkiller.bukkit.common.protocol.PacketMonitor;
 import com.bergerkiller.bukkit.common.protocol.PacketType;
 import com.bergerkiller.bukkit.common.utils.*;
 import com.bergerkiller.bukkit.sl.API.Variables;
+import com.bergerkiller.bukkit.tc.attachments.config.AttachmentModelStore;
+import com.bergerkiller.bukkit.tc.attachments.control.SeatAttachmentMap;
+import com.bergerkiller.bukkit.tc.cache.RailMemberCache;
+import com.bergerkiller.bukkit.tc.cache.RailSignCache;
+import com.bergerkiller.bukkit.tc.cache.RailTypeCache;
 import com.bergerkiller.bukkit.tc.commands.Commands;
 import com.bergerkiller.bukkit.tc.controller.*;
 import com.bergerkiller.bukkit.tc.detector.DetectorRegion;
 import com.bergerkiller.bukkit.tc.itemanimation.ItemAnimation;
 import com.bergerkiller.bukkit.tc.pathfinding.PathNode;
 import com.bergerkiller.bukkit.tc.pathfinding.PathProvider;
+import com.bergerkiller.bukkit.tc.portals.TCPortalManager;
 import com.bergerkiller.bukkit.tc.properties.CartPropertiesStore;
+import com.bergerkiller.bukkit.tc.properties.SavedTrainPropertiesStore;
 import com.bergerkiller.bukkit.tc.properties.TrainProperties;
 import com.bergerkiller.bukkit.tc.signactions.SignAction;
 import com.bergerkiller.bukkit.tc.signactions.SignActionDetector;
 import com.bergerkiller.bukkit.tc.signactions.SignActionSpawn;
+import com.bergerkiller.bukkit.tc.signactions.spawner.SpawnSignManager;
 import com.bergerkiller.bukkit.tc.statements.Statement;
 import com.bergerkiller.bukkit.tc.storage.OfflineGroupManager;
+import com.bergerkiller.bukkit.tc.tickets.TicketStore;
+import com.bergerkiller.mountiplex.conversion.Conversion;
+
 import org.bukkit.Material;
 import org.bukkit.World;
 import org.bukkit.block.Block;
@@ -32,69 +42,76 @@ import org.bukkit.entity.Entity;
 import org.bukkit.entity.Player;
 import org.bukkit.event.block.BlockEvent;
 import org.bukkit.plugin.Plugin;
+import org.bukkit.plugin.java.JavaPlugin;
 
 import java.io.File;
 import java.util.*;
 import java.util.logging.Level;
 
 public class TrainCarts extends PluginBase {
-    public static final StringReplaceBundle messageShortcuts = new StringReplaceBundle();
-    public static final StringReplaceBundle statementShortcuts = new StringReplaceBundle();
-    /*
-     * Settings
-     */
-    public static double maxVelocity;
-    public static double maxEjectDistance;
-    public static double cartDistance;
-    public static double turnedCartDistance;
-    public static double cartDistanceForcer;
-    public static double turnedCartDistanceForcer;
-    public static double nearCartDistanceFactor;
-    public static double maxCartDistance;
-    public static boolean breakCombinedCarts;
-    public static double poweredCartBoost;
-    public static double poweredRailBoost;
-    public static double pushAwayForce;
-    public static double launchForce;
-    public static boolean collisionIgnoreGlobalOwners;
-    public static boolean collisionIgnoreOwners;
-    public static boolean useCoalFromStorageCart;
-    public static boolean setOwnerOnPlacement;
-    public static boolean keepChunksLoadedOnlyWhenMoving;
-    public static boolean playSoundAtStation;
-    public static int maxDetectorLength;
-    public static int maxMinecartStackSize;
-    public static int defaultTransferRadius;
-    public static int maxTransferRadius;
-    public static boolean showTransferAnimations;
-    public static boolean slowDownEmptyCarts;
-    public static double slowDownMultiplierSlow;
-    public static double slowDownMultiplierNormal;
-    public static boolean refillAtStations;
-    public static boolean instantCreativeDestroy;
-    public static boolean allowRailEditing;
-    public static double manualMovementSpeed;
-    public static boolean allMinecartsAreTrainCarts;
-    public static boolean useNetworkSynchronizer;
-    public static boolean allowVerticalPitch;
-    public static int collisionReEnterDelay = 100; // Delay before letting mobs/player enter again
-    public static boolean EssentialsEnabled = false;
-    public static boolean SignLinkEnabled = false;
-    public static boolean MinecartManiaEnabled = false;
-    public static boolean MyWorldsEnabled = false;
-    public static boolean parseOldSigns;
     public static TrainCarts plugin;
-    private static String currencyFormat;
     private static Task fixGroupTickTask;
-    private Set<Material> allowedBlockBreakTypes = new HashSet<>();
-    private Set<String> disabledWorlds = new HashSet<>();
     private Task signtask;
+    private Task autosaveTask;
+    private Task cacheCleanupTask;
     private TCPacketListener packetListener;
+    private TCInteractionPacketListener interactionPacketListener;
     private FileConfiguration config;
-    private Map<String, ItemParser[]> parsers = new HashMap<>();
+    private AttachmentModelStore attachmentModels;
+    private SpawnSignManager spawnSignManager;
+    private SavedTrainPropertiesStore savedTrainsStore;
+    private TCMountPacketHandler mountHandler;
+    private SeatAttachmentMap seatAttachmentMap;
+
+    /**
+     * Gets a mapping of passenger entity Ids to the cart attachment seat they are occupying,
+     * if any.
+     * 
+     * @return seat attachment map
+     */
+    public SeatAttachmentMap getSeatAttachmentMap() {
+        return this.seatAttachmentMap;
+    }
+
+    /**
+     * Gets the packet handler responsible for sending entity mount packets at the right time.
+     * The handler makes sure the vehicle and passengers are spawned before issueing the mount packet.
+     * 
+     * @return mount handler
+     */
+    public TCMountPacketHandler getMountHandler() {
+        return this.mountHandler;
+    }
+
+    /**
+     * Gets the program component responsible for automatically spawning trains from spawn signs periodically.
+     * 
+     * @return spawn sign manager
+     */
+    public SpawnSignManager getSpawnSignManager() {
+        return this.spawnSignManager;
+    }
+
+    /**
+     * Gets access to the place where attachment models are stored, loaded and saved
+     * 
+     * @return attachment model store
+     */
+    public AttachmentModelStore getAttachmentModels() {
+        return this.attachmentModels;
+    }
+
+    /**
+     * Gets access to a manager for saved trains
+     * 
+     * @return saved trains store
+     */
+    public SavedTrainPropertiesStore getSavedTrains() {
+        return this.savedTrainsStore;
+    }
 
     public static boolean canBreak(Material type) {
-        return plugin.allowedBlockBreakTypes.contains(type);
+        return TCConfig.allowedBlockBreakTypes.contains(type);
     }
 
     /**
@@ -104,7 +121,7 @@ public class TrainCarts extends PluginBase {
      * @return currency text
      */
     public static String getCurrencyText(double value) {
-        return currencyFormat.replace("%value%", Double.toString(value));
+        return TCConfig.currencyFormat.replace("%value%", Double.toString(value));
     }
 
     /**
@@ -114,7 +131,7 @@ public class TrainCarts extends PluginBase {
      * @return message
      */
     public static String getMessage(String text) {
-        return StringUtil.ampToColor(messageShortcuts.replace(text));
+        return StringUtil.ampToColor(TCConfig.messageShortcuts.replace(text));
     }
 
     /**
@@ -124,7 +141,7 @@ public class TrainCarts extends PluginBase {
      * @param text   to send
      */
     public static void sendMessage(Player player, String text) {
-        if (TrainCarts.SignLinkEnabled) {
+        if (TCConfig.SignLinkEnabled) {
             int startindex, endindex;
             while ((startindex = text.indexOf('%')) != -1 && (endindex = text.indexOf('%', startindex + 1)) != -1) {
                 String varname = text.substring(startindex + 1, endindex);
@@ -148,18 +165,23 @@ public class TrainCarts extends PluginBase {
     }
 
     public static boolean isWorldDisabled(String worldname) {
-        return plugin.disabledWorlds.contains(worldname.toLowerCase());
+        return TCConfig.disabledWorlds.contains(worldname.toLowerCase());
     }
 
     public static boolean handlePlayerVehicleChange(Player player, Entity newVehicle) {
         try {
-            MinecartMember<?> newMinecart = MinecartMemberStore.get(newVehicle);
+            MinecartMember<?> newMinecart = MinecartMemberStore.getFromEntity(newVehicle);
             if (newMinecart != null) {
                 CartPropertiesStore.setEditing(player, newMinecart.getProperties());
             }
             // Allow exiting the current minecart
-            MinecartMember<?> entered = MinecartMemberStore.get(player.getVehicle());
+            MinecartMember<?> entered = MinecartMemberStore.getFromEntity(player.getVehicle());
             if (entered != null && !entered.getProperties().getPlayersExit()) {
+                return false;
+            }
+
+            // Allow entering the new minecart
+            if (newMinecart != null && !newMinecart.getProperties().getPlayersEnter()) {
                 return false;
             }
         } catch (Throwable t) {
@@ -172,7 +194,7 @@ public class TrainCarts extends PluginBase {
      * Writes the latest changes in message shortcuts to file
      */
     public void saveShortcuts() {
-        messageShortcuts.save(config.getNode("messageShortcuts"));
+        TCConfig.messageShortcuts.save(config.getNode("messageShortcuts"));
         config.save();
     }
 
@@ -185,7 +207,7 @@ public class TrainCarts extends PluginBase {
      * @return An array of associated item parsers
      */
     public ItemParser[] getParsers(String key, int amount) {
-        ItemParser[] rval = parsers.get(key.toLowerCase(Locale.ENGLISH));
+        ItemParser[] rval = TCConfig.parsers.get(key.toLowerCase(Locale.ENGLISH));
 
         if (rval == null) {
             return new ItemParser[]{ItemParser.parse(key, amount == -1 ? null : Integer.toString(amount))};
@@ -207,250 +229,29 @@ public class TrainCarts extends PluginBase {
     }
 
     public void putParsers(String key, ItemParser[] parsers) {
-        if (LogicUtil.nullOrEmpty(parsers)) {
-            this.parsers.remove(key.toLowerCase(Locale.ENGLISH));
-        } else {
-            this.parsers.put(key.toLowerCase(Locale.ENGLISH), parsers);
-        }
+        TCConfig.putParsers(key, parsers);
     }
 
     public void loadConfig() {
         config = new FileConfiguration(this);
         config.load();
-        config.setHeader("This is the configuration file of TrainCarts");
-        config.addHeader("In here you can tweak TrainCarts to what you want");
-        config.addHeader("For more information, you can visit the following websites:");
-        config.addHeader("http://www.minecraftwiki.net/wiki/Bukkit/TrainCarts");
-        config.addHeader("http://forums.bukkit.org/threads/traincarts.29491/");
-
-        config.setHeader("normal", "\nSettings for normally-aligned (straight) carts");
-        config.setHeader("normal.cartDistance", "The distance between two carts in a train");
-        config.setHeader("normal.cartDistanceForcer", "The factor at which this distance is kept");
-        cartDistance = config.get("normal.cartDistance", 1.5);
-        cartDistanceForcer = config.get("normal.cartDistanceForcer", 0.1);
-        config.setHeader("normal", "\nThe distance between two normally-aligned (straight) carts in a train");
-
-        config.setHeader("turned", "\nSettings for turned (in curve) carts");
-        config.setHeader("turned.cartDistance", "The distance between two carts in a train");
-        config.setHeader("turned.cartDistanceForcer", "The factor at which this distance is kept");
-        turnedCartDistance = config.get("turned.cartDistance", 1.6);
-        turnedCartDistanceForcer = config.get("turned.cartDistanceForcer", 0.2);
-
-        config.setHeader("nearCartDistanceFactor", "\nThe 'keep distance' factor to apply when carts are too close to each other");
-        nearCartDistanceFactor = config.get("nearCartDistanceFactor", 1.2);
-
-        config.setHeader("maxCartDistance", "\nThe maximum allowed cart distance, after this distance the carts break apart");
-        maxCartDistance = config.get("maxCartDistance", 4.0);
-
-        config.setHeader("breakCombinedCarts", "\nWhether or not the combined carts (powered/storage minecarts) break up into two items");
-        breakCombinedCarts = config.get("breakCombinedCarts", false);
-
-        config.setHeader("poweredCartBoost", "\nA performance boost to give to powered minecarts (0 = normal speed)");
-        poweredCartBoost = config.get("poweredCartBoost", 0.1);
-
-        config.setHeader("poweredRailBoost", "\nThe boosting factor of powered rails (default = 0.06)");
-        poweredRailBoost = config.get("poweredRailBoost", 0.06);
-
-        config.setHeader("maxVelocity", "\nThe maximum velocity (blocks/tick) a minecart can possibly have set");
-        maxVelocity = config.get("maxVelocity", 5.0);
-
-        config.setHeader("slowDownMultiplier", "\nThe multiplier used to slow down minecarts");
-        config.addHeader("slowDownMultiplier", "Normal is the default, slow is when the minecart is meant to slow down.");
-        slowDownMultiplierNormal = config.get("slowDownMultiplier.normal", 0.997);
-        slowDownMultiplierSlow = config.get("slowDownMultiplier.slow", 0.96);
-
-        config.setHeader("maxEjectDistance", "\nThe maximum allowed ejection distance for eject signs");
-        maxEjectDistance = config.get("maxEjectDistance", 10.0);
-
-        config.setHeader("launchForce", "\nThe amount of velocity stations give when launching trains");
-        launchForce = config.get("launchForce", 10.0);
-
-        // Deprecation backwards compatibility
-        if (config.contains("pushAway")) {
-            config.set("collision.ignoreOwners", config.get("pushAway.ignoreOwners", true));
-            config.set("collision.ignoreGlobalOwners", config.get("pushAway.ignoreGlobalOwners", false));
-            config.set("collision.pushAwayForce", config.get("pushAway.force", 0.2));
-            config.remove("pushAway");
-        }
-
-        config.setHeader("pushAway", "\nSettings used when carts push away/aside others (if enabled)");
-        config.setHeader("pushAway.ignoreOwners", "If train owners are ignored");
-        config.setHeader("pushAway.ignoreGlobalOwners", "If global train owners are ignored");
-
-        config.setHeader("collision", "\nSettings used when carts collide with entities");
-        config.setHeader("collision.ignoreOwners", "If train owners are ignored");
-        config.setHeader("collision.ignoreGlobalOwners", "If global train owners are ignored");
-        config.setHeader("collision.pushAwayForce", "The amount of force at which minecarts push away others");
-        collisionIgnoreOwners = config.get("collision.ignoreOwners", false);
-        collisionIgnoreGlobalOwners = config.get("collision.ignoreGlobalOwners", false);
-        pushAwayForce = config.get("collision.pushAwayForce", 0.2);
-
-        config.setHeader("allMinecartsAreTrainCarts", "\nWhether or not all minecarts spawned on the server turn into TrainCarts' Minecarts");
-        config.addHeader("allMinecartsAreTrainCarts", "Note that the TrainCart placement permission is then no longer active");
-        allMinecartsAreTrainCarts = config.get("allMinecartsAreTrainCarts", false);
-
-        config.setHeader("useCoalFromStorageCart", "\nWhether or not powered minecarts obtain their coal from attached storage minecarts");
-        useCoalFromStorageCart = config.get("useCoalFromStorageCart", false);
-
-        config.setHeader("setOwnerOnPlacement", "\nWhether or not the player that places a minecart is set owner");
-        setOwnerOnPlacement = config.get("setOwnerOnPlacement", true);
-
-        config.setHeader("playSoundAtStation", "\nWhether or not a hissing sound is made when trains stop at a station");
-        playSoundAtStation = config.get("playSoundAtStation", true);
-
-        config.setHeader("keepChunksLoadedOnlyWhenMoving", "\nWhether or not chunks are only kept loaded when the train is moving");
-        keepChunksLoadedOnlyWhenMoving = config.get("keepChunksLoadedOnlyWhenMoving", false);
-
-        config.setHeader("useNetworkSynchronizer", "\nAdvanced: Whether trains use a different way of server->client synchronization");
-        config.addHeader("useNetworkSynchronizer", "With this enabled, trains are expected to move smoother with less bumping");
-        config.addHeader("useNetworkSynchronizer", "With this disabled, no smoothing is applied. Only disable it if it causes problems/incompatibility");
-        useNetworkSynchronizer = config.get("useNetworkSynchronizer", true);
-
-        config.setHeader("maxDetectorLength", "\nThe maximum length a detector region (between two detectors) can be");
-        maxDetectorLength = config.get("maxDetectorLength", 2000);
-
-        config.setHeader("maxMinecartStackSize", "\nThe maximum amount of minecart items that can be stacked in one item");
-        maxMinecartStackSize = config.get("maxMinecartStackSize", 64);
-
-        config.setHeader("maxTransferRadius", "\nThe maximum radius chest/furnace sign systems look for the needed blocks");
-        maxTransferRadius = config.get("maxTransferRadius", 5);
-
-        config.setHeader("defaultTransferRadius", "\nThe default radius chest/furnace sign systems look for the needed blocks");
-        defaultTransferRadius = MathUtil.clamp(config.get("defaultTransferRadius", 2), 1, maxTransferRadius);
-
-        config.setHeader("slowDownEmptyCarts", "\nWhether or not empty minecarts slow down faster than occupied minecarts");
-        slowDownEmptyCarts = config.get("slowDownEmptyCarts", false);
-
-        config.setHeader("refillAtStations", "\nWhether storage minecarts get fuel when launching from stations");
-        refillAtStations = config.get("refillAtStations", true);
-
-        config.setHeader("instantCreativeDestroy", "\nWhether minecarts are instantly destroyed by creative players");
-        config.addHeader("instantCreativeDestroy", "Note that manual minecart movement is not possible for creative players with this enabled");
-        instantCreativeDestroy = config.get("instantCreativeDestroy", false);
-
-        config.setHeader("allowVerticalPitch", "\nWhether minecarts are allowed to have a 90-degree pitch angle when going up vertical rails");
-        config.addHeader("allowVerticalPitch", "When disabled, minecarts will keep a 0-degree pitch angle instead");
-        allowVerticalPitch = config.get("allowVerticalPitch", true);
-
-        config.setHeader("allowRailEditing", "\nWhether players (with build permissions) can edit existing rails by right-clicking on them");
-        allowRailEditing = config.get("allowRailEditing", true);
-
-        config.setHeader("manualMovementSpeed", "\nWhat velocity to set when a player tries to manually move a train (by damaging it)");
-        manualMovementSpeed = config.get("manualMovementSpeed", 12.0);
-
-        config.setHeader("currencyFormat", "\nThe currency Ticket signs will display in messages, %value% represents the displayed value");
-        currencyFormat = config.get("currencyFormat", "%value% Dollars");
-
-        config.setHeader("collisionReEnterDelay", "\nThe delay (in ticks) between ejecting and re-entering by collision (e.g. mobs auto-entering carts)");
-        collisionReEnterDelay = config.get("collisionReEnterDelay", collisionReEnterDelay);
-
-        config.setHeader("allowedBlockBreakTypes", "\nThe block materials that can be broken using minecarts");
-        config.addHeader("allowedBlockBreakTypes", "Players with the admin block break permission can use any type");
-        config.addHeader("allowedBlockBreakTypes", "Others have to use one from this list");
-        allowedBlockBreakTypes.clear();
-        if (config.contains("allowedBlockBreakTypes")) {
-            for (String value : config.getList("allowedBlockBreakTypes", String.class)) {
-                Material type = ParseUtil.parseMaterial(value, null);
-                if (type != null) allowedBlockBreakTypes.add(type);
-            }
-        } else {
-            allowedBlockBreakTypes.add(Material.CROPS);
-            allowedBlockBreakTypes.add(Material.LOG);
-        }
-
-        config.setHeader("disabledWorlds", "\nA list of world names where TrainCarts should be disabled");
-        config.addHeader("disabledWorlds", "World names are not case-sensitive");
-        this.disabledWorlds.clear();
-        if (!config.contains("disabledWorlds")) {
-            config.set("disabledWorlds", Arrays.asList("DefaultWorld1", "DefaultWorld2"));
-        }
-        for (String world : config.getList("disabledWorlds", String.class)) {
-            this.disabledWorlds.add(world.toLowerCase());
-        }
-
-        //set it again
-        List<String> types = config.getList("allowedBlockBreakTypes", String.class);
-        types.clear();
-        for (Material mat : allowedBlockBreakTypes) {
-            types.add(mat.toString());
-        }
-
-        config.setHeader("showTransferAnimations", "\nWhether or not to show item animations when transferring items");
-        showTransferAnimations = config.get("showTransferAnimations", true);
-
-        //message shortcuts
-        config.setHeader("messageShortcuts", "\nSeveral shortcuts you can use on announce signs (text is replaced)");
-        if (!config.contains("messageShortcuts")) {
-            config.set("messageShortcuts.welcome", "&eWelcome to &f");
-        }
-        messageShortcuts.clear().load(config.getNode("messageShortcuts"));
-
-        //statement shortcuts
-        config.setHeader("statementShortcuts", "\nSeveral shortcuts you can use on switcher and detector signs (text is replaced)");
-        if (!config.contains("statementShortcuts")) {
-            config.set("statementShortcuts.diamond", "i@diamond");
-        }
-        statementShortcuts.clear().load(config.getNode("statementShortcuts"));
-
-        //parser shortcuts
-        config.setHeader("itemShortcuts", "\nSeveral shortcuts you can use on signs to set the items");
-        ConfigurationNode itemshort = config.getNode("itemShortcuts");
-
-        /*
-         * Signs created before Minecraft 1.8 with (for example) "[train]" will have the brackets stripped.
-         * TrainCarts will not recognize these causing trains to ignore all "old" signs in the world.
-         * Here is a flag to recognize "train" and "!train" etc. on the top line of signs and re-add in
-         * the missing [].
-         */
-        config.setHeader("parseOldSigns", "\nParse signs made in Minecraft 1.7 and before without re-creating");
-        if (config.contains("parseOldSigns")) {
-            parseOldSigns = config.get("parseOldSigns", false);
-        }
-
-        parsers.clear();
-
-        // ================= Defaults ===============
-        if (!itemshort.contains("fuel")) {
-            itemshort.set("fuel", MaterialUtil.ISFUEL.toString());
-        }
-        if (!itemshort.contains("heatable")) {
-            itemshort.set("heatable", MaterialUtil.ISHEATABLE.toString());
-        }
-        if (!itemshort.contains("armor")) {
-            itemshort.set("armor", MaterialUtil.ISARMOR.toString());
-        }
-        if (!itemshort.contains("sword")) {
-            itemshort.set("sword", MaterialUtil.ISSWORD.toString());
-        }
-        if (!itemshort.contains("boots")) {
-            itemshort.set("boots", MaterialUtil.ISBOOTS.toString());
-        }
-        if (!itemshort.contains("leggings")) {
-            itemshort.set("leggins", MaterialUtil.ISLEGGINGS.toString());
-        }
-        if (!itemshort.contains("chestplate")) {
-            itemshort.set("chestplate", MaterialUtil.ISCHESTPLATE.toString());
-        }
-        if (!itemshort.contains("helmet")) {
-            itemshort.set("helmet", MaterialUtil.ISHELMET.toString());
-        }
-        // ===========================================
-
-        for (Map.Entry<String, String> entry : itemshort.getValues(String.class).entrySet()) {
-            putParsers(entry.getKey(), Util.getParsers(entry.getValue()));
-            itemshort.setRead(entry.getKey());
-        }
-
+        TCConfig.load(config);
         config.trim();
         config.save();
     }
 
+    public void loadSavedTrains() {
+        this.savedTrainsStore = new SavedTrainPropertiesStore(getDataFolder() + File.separator + "SavedTrainProperties.yml");
+        this.savedTrainsStore.loadModules(getDataFolder() + File.separator + "savedTrainModules");
+    }
+
     @Override
     public void updateDependency(Plugin plugin, String pluginName, boolean enabled) {
+        TCPortalManager.updateProviders(pluginName, plugin, enabled);
         switch (pluginName) {
             case "SignLink":
                 Task.stop(signtask);
-                if (SignLinkEnabled = enabled) {
+                if (TCConfig.SignLinkEnabled = enabled) {
                     log(Level.INFO, "SignLink detected, support for arrival signs added!");
                     signtask = new Task(this) {
                         public void run() {
@@ -462,13 +263,8 @@ public class TrainCarts extends PluginBase {
                     signtask = null;
                 }
                 break;
-            case "My Worlds":
-                if (MyWorldsEnabled = enabled) {
-                    log(Level.INFO, "MyWorlds detected, support for portal sign train teleportation added!");
-                }
-                break;
             case "Essentials":
-                EssentialsEnabled = enabled;
+                TCConfig.EssentialsEnabled = enabled;
                 break;
         }
     }
@@ -481,24 +277,32 @@ public class TrainCarts extends PluginBase {
     public void enable() {
         plugin = this;
 
-        //registering
-        this.register(packetListener = new TCPacketListener(), PacketType.IN_STEER_VEHICLE);
-        this.register(TCListener.class);
-        this.register(RedstoneTracker.class);
-        this.register("train", "cart");
-        Conversion.register(MemberConverter.toMember);
+        // Do this first
+        Conversion.registerConverters(MinecartMemberStore.class);
 
         //Load configuration
         loadConfig();
 
         //update max item stack
-        if (maxMinecartStackSize != 1) {
+        if (TCConfig.maxMinecartStackSize != 1) {
             for (Material material : Material.values()) {
                 if (MaterialUtil.ISMINECART.get(material)) {
-                    Util.setItemMaxSize(material, maxMinecartStackSize);
+                    Util.setItemMaxSize(material, TCConfig.maxMinecartStackSize);
                 }
             }
         }
+
+        //Initialize mount packet handler
+        this.mountHandler = new TCMountPacketHandler();
+        this.register((PacketMonitor) this.mountHandler, TCMountPacketHandler.MONITORED_TYPES);
+
+        //Initialize seat attachment map
+        this.seatAttachmentMap = new SeatAttachmentMap();
+        this.register((PacketListener) this.seatAttachmentMap, SeatAttachmentMap.LISTENED_TYPES);
+
+        //Load attachment models
+        attachmentModels = new AttachmentModelStore(getDataFolder() + File.separator + "models.yml");
+        attachmentModels.load();
 
         //init statements
         Statement.init();
@@ -508,6 +312,12 @@ public class TrainCarts extends PluginBase {
 
         //Load properties
         TrainProperties.load();
+
+        //Load tickets
+        TicketStore.load();
+
+        //Load saved trains
+        loadSavedTrains();
 
         //Load groups
         OfflineGroupManager.init(getDataFolder() + File.separator + "trains.groupdata");
@@ -525,10 +335,12 @@ public class TrainCarts extends PluginBase {
         DetectorRegion.init(getDataFolder() + File.separator + "detectorregions.dat");
 
         //Load detector sign locations
-        SignActionDetector.init(getDataFolder() + File.separator + "detectorsigns.dat");
+        SignActionDetector.INSTANCE.init(getDataFolder() + File.separator + "detectorsigns.dat");
 
-        //Load spawn sign locations
-        SignActionSpawn.init(getDataFolder() + File.separator + "spawnsigns.dat");
+        //Load spawner signs
+        spawnSignManager = new SpawnSignManager(this);
+        spawnSignManager.load(getDataFolder() + File.separator + "spawnsigns.dat");
+        spawnSignManager.init();
 
         //Restore carts where possible
         TrainCarts.plugin.log(Level.INFO, "Restoring trains and loading nearby chunks...");
@@ -537,12 +349,17 @@ public class TrainCarts extends PluginBase {
         // Start the path finding task
         PathProvider.init();
 
+        //Activate all detector regions with trains that are on it
+        DetectorRegion.detectAllMinecarts();
+
         // Hackish fix the chunk persistence failing
-        fixGroupTickTask = new Task(this) {
-            public void run() {
-                MinecartGroupStore.doFixedTick();
-            }
-        }.start(1, 1);
+        fixGroupTickTask = new TrainUpdateTask(this).start(1, 1);
+
+        // Routinely saves TrainCarts changed state information to disk (autosave=true)
+        autosaveTask = new AutosaveTask(this).start(TCConfig.autoSaveInterval, TCConfig.autoSaveInterval);
+
+        // Cleans up unused cached rail types over time to avoid memory leaks
+        cacheCleanupTask = new CacheCleanupTask(this).start(1, 1);
 
         //Properly dispose of partly-referenced carts
         CommonUtil.nextTick(new Runnable() {
@@ -552,45 +369,85 @@ public class TrainCarts extends PluginBase {
                 }
             }
         });
+
+        // Register listeners and commands
+        this.register(packetListener = new TCPacketListener(), PacketType.IN_STEER_VEHICLE, PacketType.IN_USE_ENTITY);
+        this.register(interactionPacketListener = new TCInteractionPacketListener(), TCInteractionPacketListener.TYPES);
+        this.register(TCListener.class);
+        this.register(RedstoneTracker.class);
+        this.register("train", "cart");
+
+        // Destroy all trains after initializing if specified
+        if (TCConfig.destroyAllOnShutdown) {
+            getLogger().info("[DestroyOnShutdown] Destroyed " + OfflineGroupManager.destroyAll() + " trains or minecarts");
+        }
     }
 
     /**
      * Saves all traincarts related information to file
      */
-    public void save() {
+    public void save(boolean autosave) {
         //Save properties
-        TrainProperties.save();
+        TrainProperties.save(autosave);
+
+        //Save saved trains
+        this.savedTrainsStore.save(autosave);
+
+        //Save Train tickets
+        TicketStore.save(autosave);
 
         //Save destinations
-        PathNode.save(getDataFolder() + File.separator + "destinations.dat");
+        PathNode.save(autosave, getDataFolder() + File.separator + "destinations.dat");
 
         //Save arrival times
-        ArrivalSigns.save(getDataFolder() + File.separator + "arrivaltimes.txt");
+        if (!autosave) {
+            ArrivalSigns.save(getDataFolder() + File.separator + "arrivaltimes.txt");
+        }
 
         //Save spawn sign locations
-        SignActionSpawn.save(getDataFolder() + File.separator + "spawnsigns.dat");
+        spawnSignManager.save(autosave, getDataFolder() + File.separator + "spawnsigns.dat");
 
         //Save detector sign locations
-        SignActionDetector.save(getDataFolder() + File.separator + "detectorsigns.dat");
+        SignActionDetector.INSTANCE.save(autosave, getDataFolder() + File.separator + "detectorsigns.dat");
 
         //Save detector regions
-        DetectorRegion.save(getDataFolder() + File.separator + "detectorregions.dat");
+        DetectorRegion.save(autosave, getDataFolder() + File.separator + "detectorregions.dat");
+
+        //Save attachment models
+        attachmentModels.save(autosave);
 
         // Save train information
-        OfflineGroupManager.save(getDataFolder() + File.separator + "trains.groupdata");
+        if (!autosave) {
+            OfflineGroupManager.save(getDataFolder() + File.separator + "trains.groupdata");
+        }
+
+        // Not really saving, but good to do regularly: clean up mount packet handler
+        // In case players that left the server are still stored there, this cleans that up
+        if (autosave) {
+            this.mountHandler.cleanup();
+        }
     }
 
     public void disable() {
+        //Destroy all trains after initializing if specified
+        if (TCConfig.destroyAllOnShutdown) {
+            getLogger().info("[DestroyOnShutdown] Destroyed " + OfflineGroupManager.destroyAll() + " trains or minecarts");
+        }
+
         //Unregister listeners
         this.unregister(packetListener);
+        this.unregister(interactionPacketListener);
         packetListener = null;
+        interactionPacketListener = null;
 
         //Stop tasks
         Task.stop(signtask);
         Task.stop(fixGroupTickTask);
+        Task.stop(autosaveTask);
+        Task.stop(cacheCleanupTask);
 
         //update max item stack
-        if (maxMinecartStackSize != 1) {
+        if (TCConfig.maxMinecartStackSize != 1) {
             for (Material material : Material.values()) {
                 if (MaterialUtil.ISMINECART.get(material)) {
                     Util.setItemMaxSize(material, 1);
@@ -598,8 +455,11 @@ public class TrainCarts extends PluginBase {
             }
         }
 
+        //this corrects minecart positions before saving
+        MinecartGroupStore.doPostMoveLogic();
+
         //undo replacements for correct native saving
-        for (MinecartGroup mg : MinecartGroup.getGroups()) {
+        for (MinecartGroup mg : MinecartGroup.getGroups().cloneAsIterable()) {
             mg.unload();
         }
 
@@ -613,7 +473,11 @@ public class TrainCarts extends PluginBase {
             }
         }
 
-        save();
+        //save all data to disk (autosave=false)
+        save(false);
+
+        //Disable spawn manager
+        spawnSignManager.deinit();
 
         // Deinit classes
         PathNode.deinit();
@@ -624,6 +488,9 @@ public class TrainCarts extends PluginBase {
         ItemAnimation.deinit();
         OfflineGroupManager.deinit();
         PathProvider.deinit();
+        RailTypeCache.reset();
+        RailSignCache.reset();
+        RailMemberCache.reset();
     }
 
     public boolean command(CommandSender sender, String cmd, String[] args) {
@@ -638,5 +505,55 @@ public class TrainCarts extends PluginBase {
     @Override
     public void permissions() {
         this.loadPermissions(Permission.class);
+    }
+
+    private static class CacheCleanupTask extends Task {
+
+        public CacheCleanupTask(JavaPlugin plugin) {
+            super(plugin);
+        }
+
+        @Override
+        public void run() {
+            RailTypeCache.cleanup();
+            RailSignCache.cleanup();
+        }
+    }
+    
+    private static class AutosaveTask extends Task {
+
+        public AutosaveTask(TrainCarts plugin) {
+            super(plugin);
+        }
+
+        @Override
+        public void run() {
+            ((TrainCarts) this.getPlugin()).save(true);
+        }
+    }
+
+    private static class TrainUpdateTask extends Task {
+        int ctr = 0;
+
+        public TrainUpdateTask(JavaPlugin plugin) {
+            super(plugin);
+        }
+
+        public void run() {
+            // Refresh whether or not trains are allowed to tick
+            if (++ctr >= TCConfig.tickUpdateDivider) {
+                ctr = 0;
+                TCConfig.tickUpdateNow++;
+            }
+            if (TCConfig.tickUpdateNow > 0) {
+                TCConfig.tickUpdateNow--;
+                TCConfig.tickUpdateEnabled = true;
+            } else {
+                TCConfig.tickUpdateEnabled = false;
+            }
+
+            // For all Minecart that were not ticked, tick them ourselves
+            MinecartGroupStore.doFixedTick();
+        }
     }
 }

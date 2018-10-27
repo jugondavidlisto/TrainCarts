@@ -1,12 +1,19 @@
 package com.bergerkiller.bukkit.tc.rails.type;
 
 import com.bergerkiller.bukkit.common.entity.type.CommonMinecart;
+import com.bergerkiller.bukkit.common.utils.BlockUtil;
 import com.bergerkiller.bukkit.common.utils.MaterialUtil;
 import com.bergerkiller.bukkit.common.utils.MathUtil;
-import com.bergerkiller.bukkit.tc.TrainCarts;
+import com.bergerkiller.bukkit.common.wrappers.BlockData;
+import com.bergerkiller.bukkit.tc.TCConfig;
 import com.bergerkiller.bukkit.tc.controller.MinecartMember;
+import com.bergerkiller.bukkit.tc.utils.PoweredTrackLogic;
+
 import org.bukkit.Material;
+import org.bukkit.block.Block;
 import org.bukkit.block.BlockFace;
+import org.bukkit.event.block.BlockPhysicsEvent;
+import org.bukkit.material.Rails;
 
 public class RailTypePowered extends RailTypeRegular {
     public static final double START_BOOST = 0.02;
@@ -18,6 +25,27 @@ public class RailTypePowered extends RailTypeRegular {
 
     public boolean isPowered() {
         return this.isPowered;
+    }
+
+    @Override
+    public void onBlockPlaced(Block railsBlock) {
+        super.onBlockPlaced(railsBlock);
+
+        // Also apply physics on the blocks adjacent for power to spread correctly
+        Rails rails = BlockUtil.getRails(railsBlock);
+        if (rails != null && isUpsideDown(railsBlock)) {
+            BlockUtil.applyPhysics(railsBlock.getRelative(rails.getDirection()), Material.POWERED_RAIL);
+            BlockUtil.applyPhysics(railsBlock.getRelative(rails.getDirection().getOppositeFace()), Material.POWERED_RAIL);
+        }
+    }
+
+    @Override
+    public void onBlockPhysics(BlockPhysicsEvent event) {
+        super.onBlockPhysics(event);
+        if (this.isUpsideDown(event.getBlock())) {
+            PoweredTrackLogic logic = new PoweredTrackLogic(Material.POWERED_RAIL);
+            logic.updateRedstone(event.getBlock());
+        }
     }
 
     @Override
@@ -40,13 +68,17 @@ public class RailTypePowered extends RailTypeRegular {
             double motLength = entity.vel.xz.length();
             if (motLength > 0.01) {
                 // Simple motion boosting when already moving
-                entity.vel.xz.add(entity.vel.xz, TrainCarts.poweredRailBoost / motLength);
+                entity.vel.xz.add(entity.vel.xz, TCConfig.poweredRailBoost / motLength);
             } else {
                 // Launch away from a suffocating block
-                BlockFace dir = member.getRailDirection();
+                BlockFace dir = this.getDirection(member.getBlock());
                 org.bukkit.block.Block block = member.getBlock();
+                if (this.isUpsideDown(block)) {
+                    block = block.getRelative(BlockFace.DOWN);
+                }
                 boolean pushFrom1 = MaterialUtil.SUFFOCATES.get(block.getRelative(dir.getOppositeFace()));
                 boolean pushFrom2 = MaterialUtil.SUFFOCATES.get(block.getRelative(dir));
+
                 // If pushing from both directions, block all movement
                 if (pushFrom1 && pushFrom2) {
                     entity.vel.xz.setZero();
@@ -60,7 +92,8 @@ public class RailTypePowered extends RailTypeRegular {
     }
 
     @Override
-    public boolean isRail(Material type, int data) {
-        return type == Material.POWERED_RAIL && ((data & 0x8) == 0x8) == isPowered;
+    public boolean isRail(BlockData blockData) {
+        return blockData.isType(Material.POWERED_RAIL) && ((blockData.getRawData() & 0x8) == 0x8) == isPowered;
     }
+
 }

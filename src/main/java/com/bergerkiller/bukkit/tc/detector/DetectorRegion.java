@@ -4,6 +4,7 @@ import com.bergerkiller.bukkit.common.bases.IntVector3;
 import com.bergerkiller.bukkit.common.collections.BlockMap;
 import com.bergerkiller.bukkit.common.config.DataReader;
 import com.bergerkiller.bukkit.common.config.DataWriter;
+import com.bergerkiller.bukkit.common.utils.LogicUtil;
 import com.bergerkiller.bukkit.common.utils.StreamUtil;
 import com.bergerkiller.bukkit.tc.TrainCarts;
 import com.bergerkiller.bukkit.tc.controller.MinecartGroup;
@@ -20,7 +21,7 @@ import java.util.*;
 import java.util.logging.Level;
 
 public final class DetectorRegion {
-    private static List<DetectorListener> listenerBuffer = new ArrayList<>();
+    private static boolean hasChanges = false;
     private static HashMap<UUID, DetectorRegion> regionsById = new HashMap<>();
     private static BlockMap<List<DetectorRegion>> regions = new BlockMap<>();
     private final UUID id;
@@ -34,14 +35,26 @@ public final class DetectorRegion {
         this.id = uniqueId;
         this.coordinates = coordinates;
         regionsById.put(this.id, this);
+        hasChanges = true;
         for (IntVector3 coord : this.coordinates) {
             List<DetectorRegion> list = regions.get(world, coord);
             if (list == null) {
                 list = new ArrayList<>(1);
+                list.add(this);
+                regions.put(world, coord, list);
+            } else {
+                list = new ArrayList<DetectorRegion>(list);
+                list.add(this);
                 regions.put(world, coord, list);
             }
-            list.add(this);
         }
+    }
+
+    /**
+     * Detects all minecarts that are on this region and fires onEnter events.
+     * This should be called after the listeners are set up.
+     */
+    public void detectMinecarts() {
         //load members
         World w = Bukkit.getServer().getWorld(this.world);
         if (w != null) {
@@ -54,47 +67,20 @@ public final class DetectorRegion {
         }
     }
 
-    public static List<DetectorRegion> handleMove(MinecartMember<?> mm, Block from, Block to) {
-        if (from == to) {
-            // Minecart is not moving
-        } else if (from.getWorld() != to.getWorld()) {
-            handleLeave(mm, from);
-        } else {
-            List<DetectorRegion> list = regions.get(from);
-            //Leave the regions if the to-location is not contained
-            if (list != null) {
-                IntVector3 toCoords = new IntVector3(to);
-                for (DetectorRegion region : list) {
-                    if (!region.coordinates.contains(toCoords)) {
-                        region.remove(mm);
-                    }
-                }
-            }
-        }
-        //Enter possible new locations
-        return handleEnter(mm, to);
+    /**
+     * Gets all the regions occuping a particular rails block
+     * 
+     * @param railsBlock
+     * @return list of detector regions, empty list if no regions exist
+     */
+    public static List<DetectorRegion> getRegions(Block at) {
+        return LogicUtil.fixNull(regions.get(at), Collections.emptyList());
     }
 
-    public static List<DetectorRegion> handleLeave(MinecartMember<?> mm, Block block) {
-        List<DetectorRegion> list = regions.get(block);
-        if (list == null) {
-            return Collections.emptyList();
+    public static void detectAllMinecarts() {
+        for (DetectorRegion region : regionsById.values()) {
+            region.detectMinecarts();
         }
-        for (DetectorRegion region : list) {
-            region.remove(mm);
-        }
-        return list;
-    }
-
-    public static List<DetectorRegion> handleEnter(MinecartMember<?> mm, Block block) {
-        List<DetectorRegion> list = regions.get(block);
-        if (list == null) {
-            return Collections.emptyList();
-        }
-        for (DetectorRegion region : list) {
-            region.add(mm);
-        }
-        return list;
     }
 
     public static DetectorRegion create(Collection<Block> blocks) {
@@ -132,15 +118,6 @@ public final class DetectorRegion {
         return new DetectorRegion(UUID.randomUUID(), world, coordinates);
     }
 
-    public static List<DetectorRegion> getRegions(Block at) {
-        List<DetectorRegion> rval = regions.get(at);
-        if (rval == null) {
-            return new ArrayList<>(0);
-        } else {
-            return rval;
-        }
-    }
-
     public static DetectorRegion getRegion(UUID uniqueId) {
         return regionsById.get(uniqueId);
     }
@@ -171,9 +148,13 @@ public final class DetectorRegion {
                 }
             }
         }.read();
+        hasChanges = false;
     }
 
-    public static void save(String filename) {
+    public static void save(boolean autosave, String filename) {
+        if (autosave && !hasChanges) {
+            return;
+        }
         new DataWriter(filename) {
             public void write(DataOutputStream stream) throws IOException {
                 stream.writeInt(regionsById.size());
@@ -187,6 +168,7 @@ public final class DetectorRegion {
                 }
             }
         }.write();
+        hasChanges = false;
     }
 
     public String getWorldName() {
@@ -197,12 +179,39 @@ public final class DetectorRegion {
         return this.coordinates;
     }
 
+    private void cleanUnloadedMembers() {
+        Iterator<MinecartMember<?>> iter = this.members.iterator();
+        while (iter.hasNext()) {
+            MinecartMember<?> mm = iter.next();
+            if (mm.isUnloaded()) {
+                iter.remove();
+
+                // Attempt to retrieve position info
+                Block pos = null;
+                if (mm.getEntity() != null) {
+                    pos = mm.getEntity().getLocation().getBlock();
+                } else {
+                    pos = mm.getRailTracker().getBlock();
+                    if (pos == null) {
+                        pos = mm.getRailTracker().getLastBlock();
+                    }
+                }
+                String posStr = "Unknown";
+                if (pos != null) {
+                    posStr = "[" + pos.getX() + ", " + pos.getY() + ", " + pos.getZ() + "]";
+                }
+                TrainCarts.plugin.getLogger().warning("[Detector] Purged unloaded Minecart at " + posStr);
+            }
+        }
+    }
+
     public Set<MinecartMember<?>> getMembers() {
         return this.members;
     }
 
     public Set<MinecartGroup> getGroups() {
         Set<MinecartGroup> rval = new HashSet<>();
+        this.cleanUnloadedMembers();
         for (MinecartMember<?> mm : this.members) {
             if (mm.getGroup() == null) continue;
             rval.add(mm.getGroup());
@@ -235,47 +244,46 @@ public final class DetectorRegion {
     }
 
     private void onLeave(MinecartMember<?> mm) {
-        this.setListenerBuffer();
-        for (DetectorListener listener : listenerBuffer) {
+        for (DetectorListener listener : getListeners()) {
             listener.onLeave(mm);
         }
         if (mm.isUnloaded()) {
             return;
         }
+        this.cleanUnloadedMembers();
         final MinecartGroup group = mm.getGroup();
         for (MinecartMember<?> ex : this.members) {
             if (ex != mm && ex.getGroup() == group) {
                 return;
             }
         }
-        for (DetectorListener listener : listenerBuffer) {
+        for (DetectorListener listener : getListeners()) {
             listener.onLeave(group);
         }
     }
 
     private void onEnter(MinecartMember<?> mm) {
-        this.setListenerBuffer();
-        for (DetectorListener listener : listenerBuffer) {
+        for (DetectorListener listener : getListeners()) {
             listener.onEnter(mm);
         }
         if (mm.isUnloaded()) {
             return;
         }
+        this.cleanUnloadedMembers();
         final MinecartGroup group = mm.getGroup();
         for (MinecartMember<?> ex : this.members) {
             if (ex != mm && ex.getGroup() == group) {
                 return;
             }
         }
-        for (DetectorListener listener : listenerBuffer) {
+        for (DetectorListener listener : getListeners()) {
             listener.onEnter(group);
         }
     }
 
     public void unload(MinecartGroup group) {
         if (this.members.removeAll(group)) {
-            this.setListenerBuffer();
-            for (DetectorListener listener : listenerBuffer) {
+            for (DetectorListener listener : getListeners()) {
                 listener.onUnload(group);
             }
         }
@@ -287,15 +295,17 @@ public final class DetectorRegion {
         }
     }
 
-    public void add(MinecartMember<?> mm) {
+    public boolean add(MinecartMember<?> mm) {
         if (this.members.add(mm)) {
             this.onEnter(mm);
+            return true;
+        } else {
+            return false;
         }
     }
 
-    private void setListenerBuffer() {
-        listenerBuffer.clear();
-        listenerBuffer.addAll(this.listeners);
+    private List<DetectorListener> getListeners() {
+        return new ArrayList<DetectorListener>(this.listeners);
     }
 
     public void update(MinecartMember<?> member) {
@@ -311,18 +321,23 @@ public final class DetectorRegion {
     }
 
     public void remove() {
+        this.cleanUnloadedMembers();
         Iterator<MinecartMember<?>> iter = this.members.iterator();
         while (iter.hasNext()) {
             this.onLeave(iter.next());
             iter.remove();
         }
         regionsById.remove(this.id);
+        hasChanges = true;
         for (IntVector3 coord : this.coordinates) {
             List<DetectorRegion> list = regions.get(this.world, coord);
             if (list == null) continue;
-            list.remove(this);
-            if (list.isEmpty()) {
+            if (list.size() == 1 && list.get(0) == this) {
                 regions.remove(this.world, coord);
+            } else {
+                list = new ArrayList<DetectorRegion>(list);
+                list.remove(this);
+                regions.put(this.world, coord, list);
             }
         }
     }

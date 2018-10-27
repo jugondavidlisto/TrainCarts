@@ -10,7 +10,7 @@ import com.bergerkiller.bukkit.tc.controller.MinecartGroupStore;
 import com.bergerkiller.bukkit.tc.controller.MinecartMember;
 import com.bergerkiller.bukkit.tc.controller.MinecartMemberStore;
 import com.bergerkiller.bukkit.tc.rails.logic.RailLogic;
-import com.bergerkiller.bukkit.tc.rails.logic.RailLogicVerticalSlopeDown;
+import com.bergerkiller.bukkit.tc.rails.logic.RailLogicVerticalSlopeNormalA;
 
 import org.bukkit.block.Block;
 import org.bukkit.entity.Entity;
@@ -41,13 +41,8 @@ public enum CollisionMode {
      * @return Collision Mode, or null if not parsed
      */
     public static CollisionMode parse(String text) {
-        text = text.toLowerCase();
-        if (text.startsWith("allow") || text.startsWith("enable")) {
-            return DEFAULT;
-        } else if (text.startsWith("deny") || text.startsWith("denied") || text.startsWith("disable")) {
-            return CANCEL;
-        }
-        return ParseUtil.parseEnum(CollisionMode.class, text, null);
+        CollisionMode tf = ParseUtil.isBool(text) ? (ParseUtil.parseBool(text) ? DEFAULT : CANCEL) : null;
+        return ParseUtil.parseEnum(CollisionMode.class, text, tf);
     }
 
     /**
@@ -89,7 +84,7 @@ public enum CollisionMode {
      */
     public boolean execute(MinecartMember<?> member, Entity entity) {
         final CommonMinecart<?> minecart = member.getEntity();
-        final MinecartMember<?> other = MinecartMemberStore.get(entity);
+        final MinecartMember<?> other = MinecartMemberStore.getFromEntity(entity);
         // Some default exception rules
         if (!member.isInteractable() || entity.isDead() || member.isCollisionIgnored(entity)) {
             return false;
@@ -109,9 +104,9 @@ public enum CollisionMode {
             }
             // Check if both minecarts are on the same vertical column
             RailLogic logic1 = member.getRailLogic();
-            if (logic1 instanceof RailLogicVerticalSlopeDown) {
+            if (logic1 instanceof RailLogicVerticalSlopeNormalA) {
                 RailLogic logic2 = other.getRailLogic();
-                if (logic2 instanceof RailLogicVerticalSlopeDown) {
+                if (logic2 instanceof RailLogicVerticalSlopeNormalA) {
                     Block b1 = member.getBlock(logic1.getDirection());
                     Block b2 = other.getBlock(logic2.getDirection());
                     if (BlockUtil.equals(b1, b2)) {
@@ -161,8 +156,8 @@ public enum CollisionMode {
         }
         switch (this) {
             case ENTER:
-                if (!minecart.hasPassenger() && minecart.isVehicle() && Util.canBePassenger(entity) && member.canCollisionEnter()) {
-                    minecart.setPassenger(entity);
+                if (member.getAvailableSeatCount() > 0 && Util.canBePassenger(entity) && member.canCollisionEnter()) {
+                    minecart.addPassenger(entity);
                 }
                 return false;
             case PUSH:
@@ -176,7 +171,7 @@ public enum CollisionMode {
                     if (this == DAMAGENODROPS) {
                         TCListener.cancelNextDrops = true;
                     }
-                    Double minecartEnergy = member.getForceSquared() * member.getProperties().getTrainProperties().getCollisionDamage();
+                    double minecartEnergy = member.getEntity().vel.lengthSquared() * member.getProperties().getTrainProperties().getCollisionDamage();
                     damage(member, entity, minecartEnergy);
                     push(member, entity);
                     if (this == DAMAGENODROPS) {
@@ -190,7 +185,15 @@ public enum CollisionMode {
                     if (this == KILLNODROPS) {
                         TCListener.cancelNextDrops = true;
                     }
-                    damage(member, entity, (double) Short.MAX_VALUE);
+
+                    MinecartMember<?> oldKilledByMember = TCListener.killedByMember;
+                    try {
+                        TCListener.killedByMember = member;
+                        damage(member, entity, (double) Short.MAX_VALUE);
+                    } finally {
+                        TCListener.killedByMember = oldKilledByMember;
+                    }
+
                     if (this == KILLNODROPS) {
                         TCListener.cancelNextDrops = false;
                     }
@@ -227,10 +230,11 @@ public enum CollisionMode {
             if (member.isHeadingTo(entity)) {
                 double force;
                 // Keeping distance
-                force = TrainCarts.cartDistance - member.getEntity().loc.distanceSquared(entity);
-                force *= TrainCarts.cartDistanceForcer;
+                //TODO: Needs to take cart size into account
+                force = TCConfig.cartDistanceGap + 1.0 - member.getEntity().loc.distanceSquared(entity);
+                force *= TCConfig.cartDistanceForcer;
                 // Difference in velocity
-                force += member.getForce() - entity.getVelocity().length();
+                force += member.getRealSpeed() - entity.getVelocity().length();
                 // Apply
                 if (force > 0.0) {
                     member.push(entity, force);
@@ -244,7 +248,7 @@ public enum CollisionMode {
     /*
      * Impart damage to an entity that a minecart hits
      */
-    private void damage(MinecartMember<?> member, Entity entity, Double damageAmount) {
+    private void damage(MinecartMember<?> member, Entity entity, double damageAmount) {
         if (entity instanceof LivingEntity) {
             boolean old = EntityUtil.isInvulnerable(entity);
             EntityUtil.setInvulnerable(entity, false);

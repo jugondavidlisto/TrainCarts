@@ -1,20 +1,30 @@
 package com.bergerkiller.bukkit.tc.controller;
 
+import com.bergerkiller.bukkit.common.Timings;
 import com.bergerkiller.bukkit.common.ToggledState;
-import com.bergerkiller.bukkit.common.bases.IntVector2;
 import com.bergerkiller.bukkit.common.bases.IntVector3;
-import com.bergerkiller.bukkit.common.bases.mutable.LocationAbstract;
+import com.bergerkiller.bukkit.common.config.ConfigurationNode;
 import com.bergerkiller.bukkit.common.controller.EntityController;
 import com.bergerkiller.bukkit.common.entity.CommonEntity;
 import com.bergerkiller.bukkit.common.entity.type.CommonMinecart;
+import com.bergerkiller.bukkit.common.math.Matrix4x4;
+import com.bergerkiller.bukkit.common.math.Quaternion;
+import com.bergerkiller.bukkit.common.resources.CommonSounds;
 import com.bergerkiller.bukkit.common.utils.*;
-import com.bergerkiller.bukkit.common.wrappers.BlockInfo;
+import com.bergerkiller.bukkit.common.wrappers.BlockData;
 import com.bergerkiller.bukkit.common.wrappers.DamageSource;
+import com.bergerkiller.bukkit.common.wrappers.MoveType;
 import com.bergerkiller.bukkit.tc.*;
+import com.bergerkiller.bukkit.tc.attachments.config.AttachmentModel;
+import com.bergerkiller.bukkit.tc.attachments.config.AttachmentModelOwner;
+import com.bergerkiller.bukkit.tc.cache.RailSignCache.TrackedSign;
 import com.bergerkiller.bukkit.tc.controller.components.ActionTrackerMember;
-import com.bergerkiller.bukkit.tc.controller.components.BlockTrackerMember;
-import com.bergerkiller.bukkit.tc.controller.components.RailTracker;
+import com.bergerkiller.bukkit.tc.controller.components.RailPath;
+import com.bergerkiller.bukkit.tc.controller.components.RailState;
+import com.bergerkiller.bukkit.tc.controller.components.SignTrackerMember;
+import com.bergerkiller.bukkit.tc.controller.components.RailTrackerMember;
 import com.bergerkiller.bukkit.tc.controller.components.SoundLoop;
+import com.bergerkiller.bukkit.tc.controller.components.WheelTrackerMember;
 import com.bergerkiller.bukkit.tc.events.SignActionEvent;
 import com.bergerkiller.bukkit.tc.exception.GroupUnloadedException;
 import com.bergerkiller.bukkit.tc.exception.MemberMissingException;
@@ -23,15 +33,20 @@ import com.bergerkiller.bukkit.tc.properties.CartPropertiesStore;
 import com.bergerkiller.bukkit.tc.properties.IPropertiesHolder;
 import com.bergerkiller.bukkit.tc.rails.logic.RailLogic;
 import com.bergerkiller.bukkit.tc.rails.logic.RailLogicVertical;
-import com.bergerkiller.bukkit.tc.rails.logic.RailLogicVerticalSlopeDown;
 import com.bergerkiller.bukkit.tc.rails.type.RailType;
 import com.bergerkiller.bukkit.tc.rails.type.RailTypeActivator;
 import com.bergerkiller.bukkit.tc.signactions.SignAction;
 import com.bergerkiller.bukkit.tc.signactions.SignActionType;
 import com.bergerkiller.bukkit.tc.storage.OfflineGroupManager;
 import com.bergerkiller.bukkit.tc.utils.ChunkArea;
+import com.bergerkiller.bukkit.tc.utils.CollisionBox;
+import com.bergerkiller.bukkit.tc.utils.SlowdownMode;
 import com.bergerkiller.bukkit.tc.utils.TrackIterator;
 import com.bergerkiller.bukkit.tc.utils.TrackMap;
+import com.bergerkiller.generated.net.minecraft.server.AxisAlignedBBHandle;
+import com.bergerkiller.generated.net.minecraft.server.EntityHandle;
+import com.bergerkiller.generated.net.minecraft.server.EntityLivingHandle;
+
 import org.bukkit.Chunk;
 import org.bukkit.Effect;
 import org.bukkit.Location;
@@ -39,9 +54,12 @@ import org.bukkit.World;
 import org.bukkit.block.Block;
 import org.bukkit.block.BlockFace;
 import org.bukkit.entity.Entity;
+import org.bukkit.entity.EntityType;
+import org.bukkit.entity.LivingEntity;
 import org.bukkit.entity.Minecart;
 import org.bukkit.entity.Player;
 import org.bukkit.entity.Vehicle;
+import org.bukkit.event.entity.EntityDamageEvent.DamageCause;
 import org.bukkit.event.vehicle.VehicleDamageEvent;
 import org.bukkit.event.vehicle.VehicleDestroyEvent;
 import org.bukkit.event.vehicle.VehicleMoveEvent;
@@ -54,31 +72,42 @@ import org.bukkit.util.Vector;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicInteger;
 
-public abstract class MinecartMember<T extends CommonMinecart<?>> extends EntityController<T> implements IPropertiesHolder {
+public abstract class MinecartMember<T extends CommonMinecart<?>> extends EntityController<T> implements IPropertiesHolder, AttachmentModelOwner {
+    public static final double GRAVITY_MULTIPLIER_RAILED = 0.015625;
     public static final double GRAVITY_MULTIPLIER = 0.04;
-    public static final double VERTRAIL_MULTIPLIER = 0.02;
-    public static final double VERT_TO_SLOPE_MIN_VEL = 8.0 * VERTRAIL_MULTIPLIER;
+    public static final double VERTRAIL_MULTIPLIER_LEGACY = 0.02; // LEGACY!!! Uses SLOPE_VELOCITY_MULTIPLIER instead by default.
     public static final double SLOPE_VELOCITY_MULTIPLIER = 0.0078125;
     public static final double MIN_VEL_FOR_SLOPE = 0.05;
+    public static final int MAXIMUM_DAMAGE_SUSTAINED = 40;
     protected final ToggledState forcedBlockUpdate = new ToggledState(true);
     protected final ToggledState ignoreDie = new ToggledState(false);
-    private final BlockTrackerMember blockTracker = new BlockTrackerMember(this);
+    private final SignTrackerMember signTracker = new SignTrackerMember(this);
     private final ActionTrackerMember actionTracker = new ActionTrackerMember(this);
-    private final RailTracker railTracker = new RailTracker(this);
+    private final RailTrackerMember railTrackerMember = new RailTrackerMember(this);
+    private final WheelTrackerMember wheelTracker = new WheelTrackerMember(this);
     private final ToggledState railActivated = new ToggledState(false);
+    protected final ToggledState ticked = new ToggledState();
     public boolean vertToSlope = false;
     protected MinecartGroup group;
     protected boolean died = false;
-    protected boolean unloaded = false;
+    private boolean unloaded = true;
     protected SoundLoop<?> soundLoop;
     private BlockFace direction;
     private BlockFace directionTo;
-    private BlockFace directionFrom = BlockFace.SELF;
+    private BlockFace directionFrom = null;
     private boolean ignoreAllCollisions = false;
     private int collisionEnterTimer = 0;
     private CartProperties properties;
     private Map<UUID, AtomicInteger> collisionIgnoreTimes = new HashMap<>();
-    private ChunkArea lastChunks, currentChunks;
+    private Vector speedFactor = new Vector(0.0, 0.0, 0.0);
+    private double roll = 0.0; // Roll is a custom property added, which is not persistently stored.
+    private Quaternion cachedOrientation_quat = null;
+    private float cachedOrientation_yaw = 0.0f;
+    private float cachedOrientation_pitch = 0.0f;
+    private boolean hasLinkedFarMinecarts = false;
+    private Location preMovePosition = null;
+    private Vector lastRailRefreshPosition = null;
+    private Vector lastRailRefreshDirection = null;
 
     public static boolean isTrackConnected(MinecartMember<?> m1, MinecartMember<?> m2) {
         //Can the minecart reach the other?
@@ -100,17 +129,37 @@ public abstract class MinecartMember<T extends CommonMinecart<?>> extends Entity
     @Override
     public void onAttached() {
         super.onAttached();
-        this.railTracker.onAttached();
+        this.setUnloaded(true);
+        this.railTrackerMember.onAttached();
         this.soundLoop = new SoundLoop<MinecartMember<?>>(this);
-        this.lastChunks = new ChunkArea(entity.loc.x.chunk(), entity.loc.z.chunk());
-        this.currentChunks = new ChunkArea(lastChunks);
         this.updateDirection();
+        this.wheelTracker.update();
+        this.hasLinkedFarMinecarts = false;
+
+        // Allows players to place blocks nearby a minecart despite having a custom model
+        entity.setPreventBlockPlace(false);
+
+        // Forces a standard bounding box for block collisions
+        this.setBlockCollisionBounds(new Vector(0.98, 0.7, 0.98));
+    }
+
+    @Override
+    public void onDetached() {
+        super.onDetached();
+
+        // Sometimes dead is set to true, which does not get handled until much too late
+        // But BKCommonLib does fire onDetached() when that happens. After this call the entity will be gone.
+        // It is very important to clean ourselves up here, otherwise a NPE spam occurs with /train destroyall!
+        if (this.entity.isDead()) {
+            this.onDie();
+        }
     }
 
     @Override
     public CartProperties getProperties() {
         if (this.properties == null) {
             this.properties = CartProperties.get(this);
+            this.properties.getModel().addOwner(this);
         }
         return this.properties;
     }
@@ -142,7 +191,7 @@ public abstract class MinecartMember<T extends CommonMinecart<?>> extends Entity
         if (this.group != null && this.group != group) {
             this.group.removeSilent(this);
         }
-        this.unloaded = false;
+        this.setUnloaded(false);
         this.group = group;
     }
 
@@ -160,6 +209,100 @@ public abstract class MinecartMember<T extends CommonMinecart<?>> extends Entity
         } else {
             return this.group.indexOf(this);
         }
+    }
+
+    /**
+     * Called when a train is being saved, allowing this Minecart Member to include additional data
+     * specific to the entity itself.
+     * 
+     * @param data
+     */
+    public void onTrainSaved(ConfigurationNode data) {
+    }
+
+    /**
+     * Called when a train is being spawned, allowing this Minecart Member to load additional data
+     * specific to the entity itself.
+     * 
+     * @param data
+     */
+    public void onTrainSpawned(ConfigurationNode data) {
+    }
+
+    /**
+     * Gets the orientation of the Minecart. This is the direction
+     * of the 'front' of the Minecart model. The orientation is automatically
+     * synchronized from/to the yaw/pitch rotation angles of the Entity.
+     * To avoid gymbal lock, the Quaternion is cached and returned for so long
+     * the yaw/pitch of the Entity is not altered.
+     * 
+     * @return orientation
+     */
+    public Quaternion getOrientation() {
+        if (entity.loc.getYaw() != this.cachedOrientation_yaw) {
+            this.cachedOrientation_yaw = entity.loc.getYaw();
+            this.cachedOrientation_quat = null;
+        }
+        if (entity.loc.getPitch() != this.cachedOrientation_pitch) {
+            this.cachedOrientation_pitch = entity.loc.getPitch();
+            this.cachedOrientation_quat = null;
+        }
+        if (this.cachedOrientation_quat == null) {
+            this.cachedOrientation_quat = Quaternion.fromYawPitchRoll(
+                    this.cachedOrientation_pitch,
+                    this.cachedOrientation_yaw + 90.0f,
+                    0.0f);
+        }
+        return this.cachedOrientation_quat.clone();
+    }
+
+    /**
+     * Gets the forward direction vector of the orientation of the Minecart.
+     * See also: {@link #getOrientation()}.
+     * 
+     * @return forward orientation vector
+     */
+    public Vector getOrientationForward() {
+        //TODO: Beneficial to cache this maybe?
+        return this.getOrientation().forwardVector();
+    }
+    
+    /**
+     * Sets the orientation of the Minecart. This is the direction vector
+     * of the 'front' of the Minecart model. The orientation is automatically
+     * synchronized from/to the yaw/pitch rotation angles of the Entity.
+     * 
+     * @param orientation
+     */
+    public void setOrientation(Quaternion orientation) {
+        // Check if not already equal. Don't do anything if it is.
+        // Saves unneeded trig function calls
+        if (this.cachedOrientation_quat != null) {
+            double dx = this.cachedOrientation_quat.getX() - orientation.getX();
+            double dy = this.cachedOrientation_quat.getY() - orientation.getY();
+            double dz = this.cachedOrientation_quat.getZ() - orientation.getZ();
+            double dw = this.cachedOrientation_quat.getW() - orientation.getW();
+            if ((dx*dx+dy*dy+dz*dz+dw*dw) < 1E-20) {
+                this.cachedOrientation_quat = orientation.clone();
+                return;
+            }
+        }
+
+        // Refresh
+        this.cachedOrientation_quat = orientation.clone();
+        Vector ypr = this.cachedOrientation_quat.getYawPitchRoll();
+        this.cachedOrientation_yaw = (float) ypr.getY() - 90.0f;
+        this.cachedOrientation_pitch = (float) ypr.getX();
+        entity.setRotation(this.cachedOrientation_yaw, this.cachedOrientation_pitch);
+    }
+
+    /**
+     * Flips the orientation of this Minecart, making front back and back front.
+     */
+    public void flipOrientation() {
+        Quaternion orientation = this.getOrientation();
+        orientation.rotateYFlip();
+        this.setOrientation(orientation);
     }
 
     public MinecartMember<?> getNeighbour(int offset) {
@@ -191,8 +334,24 @@ public abstract class MinecartMember<T extends CommonMinecart<?>> extends Entity
         }
     }
 
-    public BlockTrackerMember getBlockTracker() {
-        return blockTracker;
+    public SignTrackerMember getSignTracker() {
+        return signTracker;
+    }
+
+    public WheelTrackerMember getWheels() {
+        return wheelTracker;
+    }
+
+    /**
+     * Sets whether this Minecart is unloaded. An unloaded minecart can not move and can not be part of a group.
+     * Minecarts that are set unloaded will have all standard behavior frozen until they are loaded again.
+     * 
+     * @param unloaded to set to
+     */
+    public void setUnloaded(boolean unloaded) {
+        if (this.unloaded != unloaded) {
+            this.unloaded = unloaded;
+        }
     }
 
     /**
@@ -201,7 +360,7 @@ public abstract class MinecartMember<T extends CommonMinecart<?>> extends Entity
      * @return True if it is unloaded, False if not
      */
     public boolean isUnloaded() {
-        return this.unloaded;
+        return this.unloaded || this.entity == null;
     }
 
     /**
@@ -211,7 +370,86 @@ public abstract class MinecartMember<T extends CommonMinecart<?>> extends Entity
      * @return True if interactable, False if not
      */
     public boolean isInteractable() {
-        return !this.entity.isDead() && !this.isUnloaded();
+        return this.entity != null && !this.entity.isDead() && !this.isUnloaded();
+    }
+
+    /**
+     * Calculates the distance traveled by this Minecart on a block, relative
+     * to a movement direction. This is used for the adjustment from block distances
+     * to cart distances
+     * 
+     * @return block moved sub-distance
+     */
+    public double calcSubBlockDistance() {
+        double distance = 0.0;
+        IntVector3 blockPos = entity.loc.block();
+        distance += (this.direction.getModX() * (entity.loc.getX() - blockPos.midX()));
+        distance += (this.direction.getModY() * (entity.loc.getY() - blockPos.midY()));
+        distance += (this.direction.getModZ() * (entity.loc.getZ() - blockPos.midZ()));
+
+        // Normalize if sub-cardinal
+        if (FaceUtil.isSubCardinal(this.direction)) {
+            distance /= 2.0;
+        }
+
+        return distance;
+    }
+
+    /**
+     * Checks whether passengers of this Minecart take damage
+     * 
+     * @param cause of the damage
+     * @return True if damage is allowed
+     */
+    public boolean canTakeDamage(Entity passenger, DamageCause cause) {
+        if (getGroup().isTeleportImmune()) {
+            return false;
+        }
+
+        // Suffocation damage presently only occurs from blocks above because of Vanilla behavior
+        // If this Minecart does not suffocate at all, cancel this event
+        if (cause == DamageCause.SUFFOCATION && !this.isPassengerSuffocating(passenger)) {
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * Checks whether a passenger of this Minecart is stuck inside a block, and therefore will be
+     * suffocating.
+     * 
+     * @param passenger to check
+     * @return True if suffocating
+     */
+    public boolean isPassengerSuffocating(Entity passenger) {
+        // If unloaded or suffocation is disabled, return false
+        if (this.isUnloaded() || !this.getGroup().getProperties().hasSuffocation()) {
+            return false;
+        }
+
+        // Turn Minecart position into a 4x4 transform matrix
+        Matrix4x4 transform = new Matrix4x4();
+        transform.translateRotate(this.entity.getLocation());
+
+        // Transform passenger position with it
+        Vector position = this.getPassengerPosition(passenger);
+        transform.transformPoint(position);
+        BlockData dataAtPos = WorldUtil.getBlockData(entity.getWorld(),
+                position.getBlockX(), position.getBlockY(), position.getBlockZ());
+
+        // Check if suffocating
+        return dataAtPos.isSuffocating();
+    }
+
+    /**
+     * Gets the relative position of a passenger of this Minecart
+     * 
+     * @param passenger
+     * @return passenger position
+     */
+    public Vector getPassengerPosition(Entity passenger) {
+        return new Vector(0.0, 1.0, 0.0);
     }
 
     public boolean isInChunk(Chunk chunk) {
@@ -219,18 +457,23 @@ public abstract class MinecartMember<T extends CommonMinecart<?>> extends Entity
     }
 
     public boolean isInChunk(org.bukkit.World world, int cx, int cz) {
-        return world == entity.getWorld() && Math.abs(cx - entity.loc.x.chunk()) <= 2 && Math.abs(cz - entity.loc.z.chunk()) <= 2;
-    }
-
-    protected void updateChunks(Set<IntVector2> previousChunks, Set<IntVector2> newChunks) {
-        previousChunks.addAll(Arrays.asList(this.lastChunks.getChunks()));
-        newChunks.addAll(Arrays.asList(this.currentChunks.getChunks()));
-        this.lastChunks.update(this.currentChunks);
-        this.currentChunks.update(entity.loc.x.chunk(), entity.loc.z.chunk());
+        return entity != null && world == entity.getWorld() && 
+                Math.abs(cx - entity.getChunkX()) <= ChunkArea.CHUNK_RANGE && 
+                Math.abs(cz - entity.getChunkZ()) <= ChunkArea.CHUNK_RANGE;
     }
 
     public boolean isSingle() {
         return this.group == null || this.group.size() == 1;
+    }
+
+    /**
+     * Gets whether the entity yaw is inverted 180 degrees with the actual direction
+     * 
+     * @return True if inverted, False if not
+     */
+    public boolean isYawInverted() {
+        float yaw_dir = FaceUtil.faceToYaw(this.getDirection());
+        return MathUtil.getAngleDifference(yaw_dir, entity.loc.getYaw()) >= 90.0f;
     }
 
     /*
@@ -244,8 +487,14 @@ public abstract class MinecartMember<T extends CommonMinecart<?>> extends Entity
         return this.getBlock(face.getModX(), face.getModY(), face.getModZ());
     }
 
-    public Block getBlockRelative(BlockFace direction) {
-        return this.getBlock(FaceUtil.add(direction, this.getDirection()));
+    /**
+     * Gets a Block relative to the current rail, offset by the notchOffset
+     * 
+     * @param notchOffset to offset by
+     * @return relative block at this notch offset
+     */
+    public Block getBlockRelative(int notchOffset) {
+        return this.getBlock(FaceUtil.notchFaceOffset(direction, notchOffset));
     }
 
     public Rails getRails() {
@@ -259,15 +508,36 @@ public abstract class MinecartMember<T extends CommonMinecart<?>> extends Entity
     /*
      * Velocity functions
      */
-    public double getForceSquared() {
-        if (entity.isOnGround()) {
-            return entity.vel.xz.lengthSquared();
-        }
-        return entity.vel.lengthSquared();
+    public double getForce() {
+        return entity.vel.length();
     }
 
-    public double getForce() {
-        return Math.sqrt(this.getForceSquared());
+    /**
+     * Gets the real speed of the minecart, keeping the {@link MinecartGroup#getUpdateSpeedFactor()}
+     * into account. The speed is the length of the velocity vector.
+     * 
+     * @return real speed
+     */
+    public double getRealSpeed() {
+        if (this.group != null) {
+            return this.entity.vel.length() / this.group.getUpdateSpeedFactor();
+        } else {
+            return this.entity.vel.length();
+        }
+    }
+
+    /**
+     * Gets the real speed of the minecart, like {@link #getRealSpeed()}, but limits it
+     * to the maximum speed set for the train.
+     * 
+     * @return real speed, limited by max speed
+     */
+    public double getRealSpeedLimited() {
+        if (this.group != null) {
+            return Math.min(this.entity.vel.length(), this.entity.getMaxSpeed()) / this.group.getUpdateSpeedFactor();
+        } else {
+            return Math.min(this.entity.vel.length(), this.entity.getMaxSpeed());
+        }
     }
 
     public double getForwardForce() {
@@ -305,7 +575,7 @@ public abstract class MinecartMember<T extends CommonMinecart<?>> extends Entity
     }
 
     public boolean isCollisionIgnored(org.bukkit.entity.Entity entity) {
-        MinecartMember<?> member = MinecartMemberStore.get(entity);
+        MinecartMember<?> member = MinecartMemberStore.getFromEntity(entity);
         if (member != null) {
             return this.isCollisionIgnored(member);
         }
@@ -334,14 +604,14 @@ public abstract class MinecartMember<T extends CommonMinecart<?>> extends Entity
      * taking in new entities when colliding with them.
      */
     public void resetCollisionEnter() {
-        this.collisionEnterTimer = TrainCarts.collisionReEnterDelay;
+        this.collisionEnterTimer = TCConfig.collisionReEnterDelay;
     }
 
     /*
      * Actions
      */
     public void pushSideways(org.bukkit.entity.Entity entity) {
-        this.pushSideways(entity, TrainCarts.pushAwayForce);
+        this.pushSideways(entity, TCConfig.pushAwayForce);
     }
 
     public void pushSideways(org.bukkit.entity.Entity entity, double force) {
@@ -370,7 +640,7 @@ public abstract class MinecartMember<T extends CommonMinecart<?>> extends Entity
         if (showSmoke) {
             loc.getWorld().playEffect(loc, Effect.SMOKE, 0);
         }
-        loc.getWorld().playEffect(loc, Effect.EXTINGUISH, 0);
+        WorldUtil.playSound(loc, CommonSounds.EXTINGUISH, 1.0f, 2.0f);
     }
 
     /**
@@ -379,7 +649,9 @@ public abstract class MinecartMember<T extends CommonMinecart<?>> extends Entity
      * @throws MemberMissingException
      */
     public void checkMissing() throws MemberMissingException {
-        if (entity.isDead()) {
+        if (entity == null) {
+            throw new MemberMissingException();
+        } else if (entity.isDead()) {
             this.onDie();
             throw new MemberMissingException();
         } else if (this.isUnloaded()) {
@@ -401,12 +673,12 @@ public abstract class MinecartMember<T extends CommonMinecart<?>> extends Entity
      *
      * @return the Rail Tracker
      */
-    public RailTracker getRailTracker() {
-        return this.railTracker;
+    public RailTrackerMember getRailTracker() {
+        return this.railTrackerMember;
     }
 
     public IntVector3 getBlockPos() {
-        return getRailTracker().blockPos;
+        return getRailTracker().getBlockPos();
     }
 
     /**
@@ -425,6 +697,163 @@ public abstract class MinecartMember<T extends CommonMinecart<?>> extends Entity
      */
     public Block getBlock() {
         return getRailTracker().getBlock();
+    }
+
+    private final Vector calcMotionVector(boolean ignoreVelocity) {
+        // When derailed, we must rely on relative positioning to figure out the direction
+        // This only works when the minecart has a direct neighbor
+        // If no direct neighbor is available, it will default to using its own velocity
+        Vector motionVector = this.entity.getVelocity();
+        if (Double.isNaN(motionVector.lengthSquared())) {
+            motionVector = new Vector();
+        }
+        if (ignoreVelocity || motionVector.lengthSquared() <= 1e-5) {
+            if (!this.isDerailed() && this.direction != null) {
+                motionVector = FaceUtil.faceToVector(this.direction);
+            } else if (!this.isSingle()) {
+                Vector alterMotionVector = motionVector;
+                MinecartMember<?> next = this.getNeighbour(-1);
+                if (next != null) {
+                    alterMotionVector = this.getEntity().last.offsetTo(next.getEntity().last);
+                } else {
+                    MinecartMember<?> prev = this.getNeighbour(1);
+                    if (prev != null) {
+                        alterMotionVector = prev.getEntity().last.offsetTo(this.getEntity().last);
+                    }
+                }
+                if (!Double.isNaN(alterMotionVector.lengthSquared())) {
+                    motionVector = alterMotionVector;
+                }
+            }
+        }
+        if (Double.isNaN(motionVector.getX())) {
+            throw new IllegalStateException("Motion vector is NaN");
+        }
+        return motionVector;
+    }
+
+    private final boolean fillRailInformation(RailState state) {
+        // Need an initial Rail Block set
+        state.setRailBlock(entity.loc.toBlock());
+        state.setMember(this);
+        state.position().setMotion(this.calcMotionVector(false));
+
+        // No pre-move position? Simply return block at current position.
+        if (this.preMovePosition == null) {
+            state.position().setLocation(entity.getLocation());
+            return RailType.loadRailInformation(state);
+        }
+
+        // Detect the movement vector
+        Vector direction = new Vector(entity.loc.getX() - this.preMovePosition.getX(),
+                                      entity.loc.getY() - this.preMovePosition.getY(),
+                                      entity.loc.getZ() - this.preMovePosition.getZ());
+        double moved = direction.length();
+
+        // When distance is too small or too large (teleport), simply use the current position only
+        final double smallStep = 1e-7;
+        if (moved <= smallStep || moved > 0.45) {
+            state.position().setLocation(entity.getLocation());
+            return RailType.loadRailInformation(state);
+        }
+
+        // Normalize direction vector
+        direction.multiply(1.0 / moved);
+        //TODO: Do we use this direction vector for motion or not?
+        // Using this causes reverse() to not work anymore
+
+        // Iterate the blocks from the preMovePosition to the current position and discover rails here
+        // Because we move such a short distance (<=0.45) it is very rare for more than two blocks to ever be iterated
+        // So we take a shortcut and only check the pre-move and current positions for blocks in that order
+        // The pre-move position might contain an outdated block though, so add a very small amount to it in the direction
+        // There is a TODO here to use a proper block iterator.
+        Location prePos = new Location(this.entity.getWorld(),
+                this.preMovePosition.getX() + smallStep * direction.getX(),
+                this.preMovePosition.getY() + smallStep * direction.getY(),
+                this.preMovePosition.getZ() + smallStep * direction.getZ());
+        state.position().setLocation(prePos);
+        if (RailType.loadRailInformation(state)) {
+            return true;
+        }
+
+        // Current position
+        state.position().setLocation(entity.getLocation());
+        return RailType.loadRailInformation(state);
+    }
+
+    /**
+     * Looks at the current position information and attempts to discover any rails
+     * at these positions. The movement of the minecart is taken into account.
+     * If derailed, the rail type of the state is set to NONE.
+     * 
+     * @return rail state
+     */
+    public RailState discoverRail() {
+        try (Timings t = TCTimings.MEMBER_PHYSICS_DISCOVER_RAIL.start()) {
+            // Store motion vector in state
+            RailState state = new RailState();
+            state.setMember(this);
+            boolean result = this.fillRailInformation(state);
+            if (!result) {
+                state.setRailType(RailType.NONE);
+                state.position().setLocation(entity.getLocation());
+                state.setMotionVector(this.calcMotionVector(true));
+                state.initEnterDirection();
+            }
+
+            // Normalize motion vector
+            state.position().normalizeMotion();
+
+            // When railed, compute the direction by snapping the motion vector onto the rail
+            // This creates a motion vector perfectly aligned with the rail path.
+            // This is important for later when looking for more rails, because we can
+            // invert the motion vector to go 'the other way'.
+            if (state.railType() != RailType.NONE) {
+                RailLogic logic = state.loadRailLogic();
+                RailPath path = logic.getPath();
+                if (!path.isEmpty()) {
+                    path.snap(state.position(), state.railBlock());
+                }
+            }
+
+            return state;
+        }
+    }
+
+    /**
+     * Snaps a minecart onto a rail path, preserving moved distance from the last position moved.
+     * Can be used in rail logic pre/post-move to adjust and correct position on the path.
+     * 
+     * @param member to snap to this path
+     */
+    public void snapToPath(RailPath path) {
+        if (path.isEmpty()) {
+            return;
+        }
+        if (this.preMovePosition == null) {
+            this.preMovePosition = this.entity.getLocation();
+        }
+        RailPath.Position pos = RailPath.Position.fromTo(this.preMovePosition, entity.getLocation());
+        double toMove = MathUtil.length(pos.motX, pos.motY, pos.motZ);
+
+        // When movement is large, teleport is almost certain
+        // Because the only movement allowed in onMove is limited to 0.4
+        if (toMove > 0.45) {
+            this.entity.getLocation(this.preMovePosition);
+            pos = RailPath.Position.fromTo(this.preMovePosition, this.preMovePosition);
+            toMove = 0.0;
+        }
+
+        toMove -= path.move(pos, this.getBlock(), toMove);
+        this.preMovePosition.setX(pos.posX);
+        this.preMovePosition.setY(pos.posY);
+        this.preMovePosition.setZ(pos.posZ);
+        if (toMove > 0.0) {
+            pos.posX += toMove * pos.motX;
+            pos.posY += toMove * pos.motY;
+            pos.posZ += toMove * pos.motZ;
+        }
+        this.entity.setPosition(pos.posX, pos.posY, pos.posZ);
     }
 
     /*
@@ -494,18 +923,16 @@ public abstract class MinecartMember<T extends CommonMinecart<?>> extends Entity
     }
 
     public boolean isNearOf(MinecartMember<?> member) {
-        double max = TrainCarts.maxCartDistance * TrainCarts.maxCartDistance;
-        if (entity.loc.xz.distanceSquared(member.entity) > max) {
-            return false;
-        }
-        if (this.isDerailed() || this.isOnVertical() || member.isDerailed() || member.isOnVertical()) {
-            return Math.abs(entity.loc.getY() - member.entity.loc.getY()) <= max;
-        }
-        return true;
+        double max = this.getMaximumDistance(member);
+        return entity.loc.distanceSquared(member.entity) <= (max * max);
     }
 
     public boolean isHeadingTo(org.bukkit.entity.Entity entity) {
         return this.isHeadingTo(entity.getLocation());
+    }
+
+    public boolean isHeadingTo(Vector movement) {
+        return MathUtil.isHeadingTo(movement, entity.getVelocity());
     }
 
     public boolean isHeadingTo(IntVector3 location) {
@@ -573,6 +1000,9 @@ public abstract class MinecartMember<T extends CommonMinecart<?>> extends Entity
     }
 
     public BlockFace getDirectionFrom() {
+        if (this.directionFrom == null) {
+            this.directionFrom = this.directionTo;
+        }
         return this.directionFrom;
     }
 
@@ -580,13 +1010,8 @@ public abstract class MinecartMember<T extends CommonMinecart<?>> extends Entity
         return this.directionTo;
     }
 
-    public BlockFace getRailDirection() {
-        return this.getRailLogic().getDirection();
-    }
-
     public void invalidateDirection() {
-        this.direction = this.directionTo = null;
-        this.directionFrom = BlockFace.SELF;
+        this.directionFrom = this.direction = this.directionTo = null;
     }
 
     public int getDirectionDifference(BlockFace dircomparer) {
@@ -597,89 +1022,34 @@ public abstract class MinecartMember<T extends CommonMinecart<?>> extends Entity
         return this.getDirectionDifference(comparer.getDirection());
     }
 
-    public void updateDirection(Vector movement) {
-        // Take care of invalid directions before continuing
-        if (this.direction == null) {
-            this.direction = FaceUtil.getDirection(movement);
-        }
-        if (this.directionTo == null) {
-            this.directionTo = FaceUtil.getDirection(movement, false);
-        }
-        // Obtain logic and the associated direction
-        this.updateDirection(this.getRailLogic().getMovementDirection(this, movement));
-    }
-
-    public void updateDirection(BlockFace movement) {
-        // Take care of invalid directions before continuing
-        if (this.direction == null) {
-            this.direction = movement;
-        }
-        if (this.directionTo == null) {
-            if (FaceUtil.isSubCardinal(movement)) {
-                this.directionTo = FaceUtil.getDirection(this.getEntity().getVelocity(), false);
-            } else {
-                this.directionTo = movement;
-            }
-        }
-        final boolean fromInvalid = this.directionFrom == BlockFace.SELF;
-        if (fromInvalid) {
-            this.directionFrom = this.directionTo;
-        }
-        // Obtain logic and the associated direction
-        this.direction = movement;
-
-        // Calculate the to direction
-        if (FaceUtil.isSubCardinal(this.direction)) {
-            // Compare with the rail direction for curved rails
-            // TODO: Turn this into an understandable transformation
-            final BlockFace raildirection = this.getRailDirection();
-            if (this.direction == BlockFace.NORTH_EAST) {
-                this.directionTo = raildirection == BlockFace.NORTH_WEST ? BlockFace.EAST : BlockFace.NORTH;
-            } else if (this.direction == BlockFace.SOUTH_EAST) {
-                this.directionTo = raildirection == BlockFace.NORTH_EAST ? BlockFace.SOUTH : BlockFace.EAST;
-            } else if (this.direction == BlockFace.SOUTH_WEST) {
-                this.directionTo = raildirection == BlockFace.NORTH_WEST ? BlockFace.SOUTH : BlockFace.WEST;
-            } else if (this.direction == BlockFace.NORTH_WEST) {
-                this.directionTo = raildirection == BlockFace.NORTH_EAST ? BlockFace.WEST : BlockFace.NORTH;
-            }
-        } else {
-            // Simply set it for other types of rails
-            this.directionTo = this.direction;
-        }
-
-        // Force-update the from direction if it was invalidated
-        if (fromInvalid) {
-            this.directionFrom = this.directionTo;
-        }
-    }
-
     public void updateDirection() {
-        this.updateDirection(this.entity.getVelocity());
-    }
+        RailTrackerMember tracker = this.getRailTracker();
 
-    public void updateDirectionFromTo(LocationAbstract from, LocationAbstract to) {
-        this.updateDirection(from.offsetTo(to.getX(), to.getY(), to.getZ()));
-    }
+        // Direction is simply the motion vector on the rail, turned into a BlockFace
+        RailState state = tracker.getState();
+        this.direction = state.position().getMotionFaceWithSubCardinal();
 
-    public void updateDirectionTo(MinecartMember<?> member) {
-        this.updateDirectionFromTo(this.entity.last, member.entity.last);
-    }
-
-    public void updateDirectionFrom(MinecartMember<?> member) {
-        this.updateDirectionFromTo(member.entity.last, this.entity.last);
+        // TO direction is simply the enter face in the opposite direction
+        RailState state_inv = state.clone();
+        state_inv.position().invertMotion();
+        state_inv.initEnterDirection();
+        this.directionTo = state_inv.enterFace().getOppositeFace();
     }
 
     @Override
-    public void onDamage(DamageSource damagesource, double damage) {
+    public boolean onDamage(DamageSource damagesource, double damage) {
         if (this.entity.isDead()) {
-            return;
+            return false;
+        }
+        if (damagesource.toString().equals("fireworks")) {
+            return false; // Ignore firework damage (used for cosmetics)
         }
         final Entity damager = damagesource.getEntity();
         try {
             // Call CraftBukkit event
             VehicleDamageEvent event = new VehicleDamageEvent(this.entity.getEntity(), damager, damage);
             if (CommonUtil.callEvent(event).isCancelled()) {
-                return;
+                return true;
             }
             damage = event.getDamage();
             // Play shaking animation and logic
@@ -688,14 +1058,15 @@ public abstract class MinecartMember<T extends CommonMinecart<?>> extends Entity
             this.entity.setVelocityChanged(true);
             this.entity.setDamage(this.entity.getDamage() + damage * 10);
             // Check whether the entity is a creative (insta-build) entity
-            if (TrainCarts.instantCreativeDestroy && Util.canInstantlyBuild(damager)) {
+            boolean isInstantlyDestroyed = Util.canInstantlyBreakMinecart(damager);
+            if (isInstantlyDestroyed) {
                 this.entity.setDamage(100);
             }
-            if (this.entity.getDamage() > 40) {
+            if (this.entity.getDamage() > MAXIMUM_DAMAGE_SUSTAINED) {
                 // Send an event, pass in the drops to drop
                 List<ItemStack> drops = new ArrayList<>(2);
-                if (getProperties().getSpawnItemDrops()) {
-                    if (TrainCarts.breakCombinedCarts) {
+                if (!isInstantlyDestroyed && getProperties().getSpawnItemDrops()) {
+                    if (TCConfig.breakCombinedCarts) {
                         drops.addAll(this.entity.getBrokenDrops());
                     } else {
                         drops.add(new ItemStack(this.entity.getCombinedItem()));
@@ -703,8 +1074,8 @@ public abstract class MinecartMember<T extends CommonMinecart<?>> extends Entity
                 }
                 VehicleDestroyEvent destroyEvent = new VehicleDestroyEvent(this.entity.getEntity(), damager);
                 if (CommonUtil.callEvent(destroyEvent).isCancelled()) {
-                    this.entity.setDamage(40);
-                    return;
+                    this.entity.setDamage(MAXIMUM_DAMAGE_SUSTAINED);
+                    return true;
                 }
 
                 // Spawn drops and die
@@ -712,10 +1083,16 @@ public abstract class MinecartMember<T extends CommonMinecart<?>> extends Entity
                     this.entity.spawnItemDrop(stack, 0.0F);
                 }
                 this.onDie();
+            } else {
+                // Select the Minecart for editing otherwise
+                if (damager instanceof Player) {
+                    CartProperties.setEditing((Player) damager, this.getProperties());
+                }
             }
         } catch (Throwable t) {
             TrainCarts.plugin.handle(t);
         }
+        return true;
     }
 
     /**
@@ -744,11 +1121,13 @@ public abstract class MinecartMember<T extends CommonMinecart<?>> extends Entity
                     }
                     if (this.group != null) {
                         entity.setDead(false);
-                        this.getBlockTracker().clear();
+                        this.getSignTracker().clear();
                         entity.setDead(true);
                     }
                     if (entity.hasPassenger()) {
-                        entity.setPassenger(null);
+                        for (Entity passenger : entity.getPassengers()) {
+                            entity.removePassenger(passenger);
+                        }
                     }
                     if (this.group != null) {
                         this.group.remove(this);
@@ -763,15 +1142,31 @@ public abstract class MinecartMember<T extends CommonMinecart<?>> extends Entity
 
     @Override
     public boolean onEntityCollision(Entity e) {
+        // Check if Entity not a passenger of this Train
+        MinecartMember<?> vehicleTrain = MinecartMemberStore.getFromEntity(entity.getVehicle());
+        if (vehicleTrain != null && vehicleTrain.group == this.group) {
+            return false;
+        }
+
         if (!this.isInteractable()) {
             return false;
         }
+
+        // Verify that the entity is actually inside the bounding box of this entity
+        // This involves a complicated rotated box intersection test
+        if (!this.isModelIntersectingWith(e)) {
+            return false;
+        }
+
         CollisionMode mode = this.getGroup().getProperties().getCollisionMode(e);
         if (!mode.execute(this, e)) {
             return false;
         }
         // Collision occurred, collided head-on? Stop the entire train
         if (this.isHeadingTo(e)) {
+            if (entity instanceof Minecart) {
+                return false;
+            }
             this.getGroup().stop();
         }
         return true;
@@ -779,24 +1174,114 @@ public abstract class MinecartMember<T extends CommonMinecart<?>> extends Entity
 
     @Override
     public boolean onBlockCollision(org.bukkit.block.Block hitBlock, BlockFace hitFace) {
-        if (!RailType.getType(hitBlock).onCollide(this, hitBlock, hitFace)) {
-            return false;
-        }
-        if (!getRailType().onBlockCollision(this, getBlock(), hitBlock, hitFace)) {
-            return false;
-        }
-        // Stop the entire Group if hitting head-on
-        final boolean hitHeadOn;
-        IntVector3 delta = new IntVector3(hitBlock).subtract(this.getEntity().loc.block());
-        if (FaceUtil.isVertical(this.getDirectionTo())) {
-            hitHeadOn = delta.x == 0 && delta.z == 0 && delta.y == this.getDirectionTo().getModY();
-        } else {
-            hitHeadOn = delta.x == this.getDirectionTo().getModX() && delta.z == this.getDirectionTo().getModZ();
-        }
-        if (hitHeadOn) {
-            this.getGroup().stop();
+        try (Timings t = TCTimings.MEMBER_PHYSICS_BLOCK_COLLISION.start()) {
+            // When the minecart is vertical, minecraft likes to make it collide with blocks on the opposite facing
+            // Detect this and cancel this collision. This allows smooth air<>vertical logic.
+            Vector upVector = this.getOrientation().upVector();
+            if (upVector.getY() >= -0.1 && upVector.getY() <= 0.1) {
+                // If HitBlock x/z space contains the x/z position of the Minecart, allow the collision
+                double closest_dx = this.entity.loc.getX() - hitBlock.getX();
+                double closest_dz = this.entity.loc.getZ() - hitBlock.getZ();
+                final double MIN_COORD = 1e-10;
+                final double MAX_COORD = 1.0 - MIN_COORD;
+                if (closest_dx >= MIN_COORD && closest_dx <= MAX_COORD && closest_dz >= MIN_COORD && closest_dz <= MAX_COORD) {
+                    // Block is directly above or below; allow the collision
+                } else if (upVector.getX() >= -0.1 && upVector.getX() <= 0.1) {
+                    if ((-closest_dz) < -0.5) closest_dz -= 1.0;
+                    if ((upVector.getZ() > 0.0 && (-closest_dz) < -0.01)) return false;
+                    if ((upVector.getZ() < 0.0 && (-closest_dz) > 0.01)) return false;
+                } else if (upVector.getZ() >= -0.1 && upVector.getZ() <= 0.1) {
+                    if ((-closest_dx) < -0.5) closest_dx -= 1.0;
+                    if ((upVector.getX() > 0.0 && (-closest_dx) < -0.01)) return false;
+                    if ((upVector.getX() < 0.0 && (-closest_dx) > 0.01)) return false;
+                }
+            }
+
+            if (!RailType.getType(hitBlock).onCollide(this, hitBlock, hitFace)) {
+                return false;
+            }
+            if (!getRailType().onBlockCollision(this, getBlock(), hitBlock, hitFace)) {
+                return false;
+            }
+
+            // Stop the entire Group if hitting head-on
+            if (getRailType().isHeadOnCollision(this, getBlock(), hitBlock)) {
+                this.getGroup().stop();
+            }
         }
         return true;
+    }
+
+    /**
+     * Checks whether the bounding box of another Entity is intersecting with this
+     * minecart's 3d model bounding box
+     * 
+     * @param entity
+     * @return True if intersecting
+     */
+    public boolean isModelIntersectingWith(Entity entity) {
+        MinecartMember<?> other = MinecartMemberStore.getFromEntity(entity);
+        if (other != null) {
+            // Have to do both ways around!
+            return this.isModelIntersectingWith_impl(entity) &&
+                   other.isModelIntersectingWith_impl(this.entity.getEntity());
+        } else {
+            return this.isModelIntersectingWith_impl(entity);
+        }
+    }
+
+    private final boolean isModelIntersectingWith_impl(Entity entity) {
+        // We lack a proper bounding box collision test
+        // Instead we do a poor man's method of probing various points on the entity
+        AxisAlignedBBHandle aabb = EntityHandle.fromBukkit(entity).getBoundingBox();
+        double[] xval = {aabb.getMinX(), 0.5 * (aabb.getMinX() + aabb.getMaxX()), aabb.getMaxX()};
+        double[] yval = {aabb.getMinY(), 0.5 * (aabb.getMinY() + aabb.getMaxY()), aabb.getMaxY()};
+        double[] zval = {aabb.getMinZ(), 0.5 * (aabb.getMinZ() + aabb.getMaxZ()), aabb.getMaxZ()};
+        for (double x : xval) {
+            for (double y : yval) {
+                for (double z : zval) {
+                    if (isModelIntersectingWith_pointTest(x, y, z)) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    private final boolean isModelIntersectingWith_pointTest(double x, double y, double z) {
+        return calculateModelDistance(new Vector(x, y, z)) <= 0.1;
+    }
+
+    /**
+     * Calculates the distance between a point and this minecart's 3d model shape.
+     * The position as controlled by the wheels is used for this.
+     * 
+     * @param point
+     * @return distance
+     */
+    public double calculateModelDistance(Vector point) {
+        // Factor in the offset of the minecart in world coordinates versus the point
+        point = point.clone().subtract(this.getWheels().getPosition());
+
+        // Undo the effects of the orientation of the Minecart
+        Quaternion invOri = this.getOrientation().clone();
+        invOri.invert();
+        invOri.transformPoint(point);
+
+        // Compute the 3d box coordinates of this Minecart
+        double x_min = -0.5;
+        double x_max = 0.5;
+        double y_min = 0.0;
+        double y_max = 1.0;
+        double z_min = -0.5 * this.entity.getWidth();
+        double z_max = 0.5 * this.entity.getWidth();
+
+        // Perform box to point distance test using max and length
+        double dx = Math.max(0.0, Math.max(x_min - point.getX(), point.getX() - x_max));
+        double dy = Math.max(0.0, Math.max(y_min - point.getY(), point.getY() - y_max));
+        double dz = Math.max(0.0, Math.max(z_min - point.getZ(), point.getZ() - z_max));
+        return Math.sqrt(dx*dx + dy*dy + dz*dz);
     }
 
     /**
@@ -805,11 +1290,12 @@ public abstract class MinecartMember<T extends CommonMinecart<?>> extends Entity
      * @return the passenger Player inventory, or null if there is no player
      */
     public PlayerInventory getPlayerInventory() {
-        Entity passenger = entity.getPassenger();
-        if (passenger instanceof Player) {
-            return ((Player) passenger).getInventory();
-        } else {
+        List<Player> players = entity.getPlayerPassengers();
+        if (players.isEmpty()) {
             return null;
+        } else {
+            //TODO: Perhaps allow more than one player? Its weird.
+            return players.get(0).getInventory();
         }
     }
 
@@ -853,11 +1339,13 @@ public abstract class MinecartMember<T extends CommonMinecart<?>> extends Entity
      */
     public void eject(final Location to) {
         if (entity.hasPassenger()) {
-            TCListener.ignoreNextEject = true;
-            final Entity passenger = this.entity.getPassenger();
+            List<Entity> oldPassengers = new ArrayList<Entity>(this.entity.getPassengers());
+            TCListener.exemptFromEjectOffset.addAll(oldPassengers);
             this.eject();
-            EntityUtil.teleportNextTick(passenger, to);
-            TCListener.ignoreNextEject = false;
+            for (Entity oldPassenger : oldPassengers) {
+                EntityUtil.teleportNextTick(oldPassenger, to);
+            }
+            TCListener.exemptFromEjectOffset.removeAll(oldPassengers);
         }
     }
 
@@ -867,7 +1355,37 @@ public abstract class MinecartMember<T extends CommonMinecart<?>> extends Entity
 
     @Override
     public void onPropertiesChanged() {
-        this.getBlockTracker().update();
+        this.getSignTracker().update();
+
+        // Enable/disable collision handling to improve performance
+        if (this.group != null) {
+            this.setEntityCollisionEnabled(this.group.getProperties().getColliding());
+            this.setBlockCollisionEnabled(this.group.getProperties().blockCollision == CollisionMode.DEFAULT);
+        }
+    }
+
+    @Override
+    public void onModelChanged(AttachmentModel model) {
+        if (entity == null) {
+            model.removeOwner(this);
+            return;
+        }
+        entity.setSize(model.getCartLength(), 0.7f);
+        this.wheelTracker.back().setDistance(0.5 * model.getWheelDistance() - model.getWheelCenter());
+        this.wheelTracker.front().setDistance(0.5 * model.getWheelDistance() + model.getWheelCenter());
+
+        // Limit the wheel distances to the bounds of half the cart length and 0.0
+        double halfLength = 0.5 * model.getCartLength();
+        if (this.wheelTracker.back().getDistance() < 0.0) {
+            this.wheelTracker.back().setDistance(0.0);
+        } else if (this.wheelTracker.back().getDistance() > halfLength) {
+            this.wheelTracker.back().setDistance(halfLength);
+        }
+        if (this.wheelTracker.front().getDistance() < 0.0) {
+            this.wheelTracker.front().setDistance(0.0);
+        } else if (this.wheelTracker.front().getDistance() > halfLength) {
+            this.wheelTracker.front().setDistance(halfLength);
+        }
     }
 
     /**
@@ -899,29 +1417,18 @@ public abstract class MinecartMember<T extends CommonMinecart<?>> extends Entity
         }
     }
 
-    public void reverse() {
-        reverse(true);
-    }
-
-    public void reverse(boolean reverseVelocity) {
-        if (reverseVelocity) {
-            entity.vel.multiply(-1.0);
-        }
-        this.updateDirection(this.getDirection().getOppositeFace());
-    }
-
-    public void updateUnloaded() {
-        unloaded = OfflineGroupManager.containsMinecart(entity.getUniqueId());
-        if (!unloaded) {
+    protected void updateUnloaded() {
+        setUnloaded((entity == null) || OfflineGroupManager.containsMinecart(entity.getUniqueId()));
+        if (!unloaded && (this.group == null || this.group.canUnload())) {
             // Check a 5x5 chunk area around this Minecart to see if it is loaded
             World world = entity.getWorld();
-            int midX = entity.loc.x.chunk();
-            int midZ = entity.loc.z.chunk();
+            int midX = entity.getChunkX();
+            int midZ = entity.getChunkZ();
             int cx, cz;
-            for (cx = -2; cx <= 2; cx++) {
-                for (cz = -2; cz <= 2; cz++) {
+            for (cx = -ChunkArea.CHUNK_RANGE; cx <= ChunkArea.CHUNK_RANGE; cx++) {
+                for (cz = -ChunkArea.CHUNK_RANGE; cz <= ChunkArea.CHUNK_RANGE; cz++) {
                     if (!WorldUtil.isLoaded(world, cx + midX, cz + midZ)) {
-                        unloaded = true;
+                        setUnloaded(true);
                         return;
                     }
                 }
@@ -945,20 +1452,18 @@ public abstract class MinecartMember<T extends CommonMinecart<?>> extends Entity
     public void onBlockChange(Block from, Block to) {
         // Update from direction
         if (BlockUtil.getManhattanDistance(from, to, true) > 3) {
-            this.directionFrom = BlockFace.SELF;
-        } else {
-            this.directionFrom = this.directionTo;
+            this.directionFrom = null; // invalidate from direction - too long ago
         }
 
         // Destroy blocks
         if (!this.isDerailed() && this.getProperties().hasBlockBreakTypes()) {
-            Block left = this.getBlockRelative(BlockFace.WEST);
-            Block right = this.getBlockRelative(BlockFace.EAST);
+            Block left = this.getBlockRelative(-2);
+            Block right = this.getBlockRelative(2);
             if (this.getProperties().canBreak(left)) {
-                BlockInfo.get(left).destroy(left, 20.0f);
+                WorldUtil.getBlockData(left).destroy(left, 20.0f);
             }
             if (this.getProperties().canBreak(right)) {
-                BlockInfo.get(right).destroy(right, 20.0f);
+                WorldUtil.getBlockData(right).destroy(right, 20.0f);
             }
         }
     }
@@ -980,7 +1485,27 @@ public abstract class MinecartMember<T extends CommonMinecart<?>> extends Entity
         // Prepare
         entity.vel.fixNaN();
         entity.last.set(entity.loc);
-        getRailTracker().refreshBlock();
+    }
+
+    /**
+     * Reads input from passengers of this Minecart to perform manual movement of the minecart, if enabled
+     */
+    public void updateManualMovement() {
+        // Vehicle steering input from living entity passengers
+        // This is only allowed when the property is enabled and our velocity < 0.1 blocks/tick (0.01 squared)
+        if (getGroup().getProperties().isManualMovementAllowed() && entity.vel.lengthSquared() < 0.01 && !this.isDerailed()) {
+            for (Entity passenger : entity.getPassengers()) {
+                if (passenger instanceof LivingEntity) {
+                    float forwardMovement = EntityLivingHandle.fromBukkit((LivingEntity) passenger).getForwardMovement();
+                    if (forwardMovement > 0.0f) {
+                        // Use Entity yaw and pitch to find the direction to boost the minecart into
+                        // For now, this only supports horizontal 'pushing'
+                        Vector direction = ((LivingEntity) passenger).getEyeLocation().getDirection();
+                        entity.vel.add(direction.getX() * 0.1, 0.0, direction.getZ() * 0.1);
+                    }
+                }
+            }
+        }
     }
 
     /**
@@ -1007,11 +1532,6 @@ public abstract class MinecartMember<T extends CommonMinecart<?>> extends Entity
             throw new MemberMissingException();
         }
 
-        // Perform gravity
-        if (!isMovementControlled()) {
-            entity.vel.y.subtract(getRailLogic().getGravityMultiplier(this));
-        }
-
         // reset fall distance
         if (!this.isDerailed()) {
             entity.setFallDistance(0.0f);
@@ -1020,14 +1540,19 @@ public abstract class MinecartMember<T extends CommonMinecart<?>> extends Entity
         // Perform rails logic
         getRailLogic().onPreMove(this);
 
+        // Refresh last-update direction and block information
+        this.getRailTracker().updateLast();
+
         // Update the entity shape
         entity.setPosition(entity.loc.getX(), entity.loc.getY(), entity.loc.getZ());
 
         if (getGroup().getProperties().isManualMovementAllowed() && entity.hasPassenger()) {
-            Vector vel = entity.getPassenger().getVelocity();
-            vel.setY(0.0);
-            if (vel.lengthSquared() > 1.0E-4 && entity.vel.xz.lengthSquared() < 0.01) {
-                entity.vel.xz.add(vel.multiply(0.1));
+            for (Entity passenger : entity.getPassengers()) {
+                Vector vel = passenger.getVelocity();
+                vel.setY(0.0);
+                if (vel.lengthSquared() > 1.0E-4 && entity.vel.xz.lengthSquared() < 0.01) {
+                    entity.vel.xz.add(vel.multiply(0.1));
+                }
             }
         }
 
@@ -1056,43 +1581,184 @@ public abstract class MinecartMember<T extends CommonMinecart<?>> extends Entity
     }
 
     /**
+     * Gets a normalized vector of the desired orientation of the Minecart
+     * 
+     * @return orientation
+     */
+    public Vector calculateOrientation() {
+        MinecartGroup group = this.getGroup();
+        double dx = 0.0, dy = 0.0, dz = 0.0;
+        if (group.size() <= 1) {
+            dx = entity.getMovedX();
+            dy = entity.getMovedY();
+            dz = entity.getMovedZ();
+        } else {
+            // Find our displayed angle based on the relative position of this Minecart to the neighbours
+            int n = 0;
+            if (this != group.head()) {
+                // Add difference between this cart and the cart before
+                MinecartMember<?> m = this.getNeighbour(-1);
+                Vector m_pos = m.calcSpeedFactorPos();
+                Vector s_pos = this.calcSpeedFactorPos();
+                dx += m_pos.getX() - s_pos.getX();
+                dy += m_pos.getY() - s_pos.getY();
+                dz += m_pos.getZ() - s_pos.getZ();
+                n++;
+            }
+            if (this != group.tail()) {
+                // Add difference between this cart and the cart after
+                MinecartMember<?> m = this.getNeighbour(1);
+                Vector m_pos = m.calcSpeedFactorPos();
+                Vector s_pos = this.calcSpeedFactorPos();
+                dx += s_pos.getX() - m_pos.getX();
+                dy += s_pos.getY() - m_pos.getY();
+                dz += s_pos.getZ() - m_pos.getZ();
+                n++;
+            }
+            dx /= n;
+            dy /= n;
+            dz /= n;
+        }
+
+        // Normalize the vector. Take extra care to avoid a NaN when the vector length approaches zero
+        double length = MathUtil.length(dx, dy, dz);
+        if (length < 0.0001) {
+            return this.getOrientationForward();
+        } else {
+            return new Vector(dx / length, dy / length, dz / length);
+        }
+    }
+
+    private Vector calcSpeedFactorPos() {
+        return getWheels().getPosition();
+    }
+
+    public void calculateSpeedFactor() {
+        this.speedFactor.setX(0.0).setY(0.0).setZ(0.0);
+        MinecartGroup group = this.getGroup();
+        if (group.size() != 1) {
+            MinecartMember<?> n1 = this.getNeighbour(-1);
+            MinecartMember<?> n2 = this.getNeighbour(1);
+            if (n1 != null) {
+                this.speedFactor.add(calculateSpeedFactor(n1, this));
+            }
+            if (n2 != null) {
+                this.speedFactor.add(calculateSpeedFactor(this, n2));
+            }
+            if (n1 != null && n2 != null) {
+                this.speedFactor.multiply(0.5);
+            }
+        }
+    }
+
+    private final Vector calculateSpeedFactor(MinecartMember<?> m1, MinecartMember<?> m2) {
+        // Retrieve the positions of the backwards moving part of the cart,
+        // and the forwards moving part of the cart behind. The gap
+        // between these two positions must be kept.
+        WheelTrackerMember.Wheel m1wheel = m1.getWheels().movingBackwards();
+        WheelTrackerMember.Wheel m2wheel = m2.getWheels().movingForwards();
+        Vector m1pos = m1wheel.getAbsolutePosition();
+        Vector m2pos = m2wheel.getAbsolutePosition();
+        Vector direction;
+        if (m1 == this) {
+            direction = m1pos.subtract(m2pos);
+        } else {
+            direction = m2pos.subtract(m1pos);
+        }
+
+        // If distance can not be reliably calculated, use BlockFace direction
+        // Otherwise normalize the direction vector
+        double distance = direction.length();
+        if (distance < 0.01) {
+            direction.setX(this.getDirection().getModX());
+            direction.setY(this.getDirection().getModY());
+            direction.setZ(this.getDirection().getModZ());
+            direction.normalize();
+        } else {
+            direction.setX(direction.getX() / distance);
+            direction.setY(direction.getY() / distance);
+            direction.setZ(direction.getZ() / distance);
+        }
+
+        // Calculate the preferred distance between these two wheels
+        // Keep the edge between wheel and edge of cart in mind
+        double preferredDistance = m1wheel.getEdgeDistance() + m2wheel.getEdgeDistance() + TCConfig.cartDistanceGap;
+
+        // Set the factor to the offset we must make to correct the distance
+        double distanceDiff = (preferredDistance - distance);
+        direction.multiply(distanceDiff);
+        return direction;
+    }
+
+    /**
      * Moves the minecart and performs post-movement logic such as events, onBlockChanged and other (rail) logic
      * Physics stage: <b>4</b>
      *
-     * @param speedFactor to apply when moving
+     * @param speedFactor to apply, which is used to adjust minecart positioning
      * @throws MemberMissingException - thrown when the minecart is dead or dies
      * @throws GroupUnloadedException - thrown when the group is no longer loaded
      */
-    public void onPhysicsPostMove(double speedFactor) throws MemberMissingException, GroupUnloadedException {
+    public void onPhysicsPostMove() throws MemberMissingException, GroupUnloadedException {
         this.checkMissing();
 
-        // Modify speed factor to stay within bounds
-        speedFactor = MathUtil.clamp(MathUtil.fixNaN(speedFactor, 1), 0.1, 10);
-
-        // Apply speed factor to maxed and not-a-number-fixed values
-        double motX = speedFactor * entity.vel.x.fixNaN().getClamped(entity.getMaxSpeed());
-        double motY = speedFactor * entity.vel.y.fixNaN().getClamped(entity.getMaxSpeed());
-        double motZ = speedFactor * entity.vel.z.fixNaN().getClamped(entity.getMaxSpeed());
-
-        // No vertical motion if stuck to the rails that way
-        if (!getRailLogic().hasVerticalMovement()) {
-            motY = 0.0;
+        // Limit velocity to Max Speed
+        entity.vel.fixNaN();
+        Vector vel = entity.getVelocity();
+        if (TCConfig.legacySpeedLimiting) {
+            // Legacy limiting limited each axis individually
+            // In curves and when going up, this resulted in speeds higher than permitted
+            vel.setX(MathUtil.clamp(vel.getX(), entity.getMaxSpeed()));
+            vel.setY(MathUtil.clamp(vel.getY(), entity.getMaxSpeed()));
+            vel.setZ(MathUtil.clamp(vel.getZ(), entity.getMaxSpeed()));
+        } else {
+            // New limiting system preserves the velocity direction, but normalizes it to the max speed
+            double vel_length = entity.vel.length();
+            if (vel_length > entity.getMaxSpeed()) {
+                double vel_factor = (entity.getMaxSpeed() / vel_length);
+                vel.multiply(vel_factor);
+            }
         }
 
+        // Apply speed factor to adjust the minecart positions relative to each other
+        // The rate at which this happens depends on the speed of the minecart
+        this.getRailLogic().onSpacingUpdate(this, vel, this.speedFactor);
+
+        // No vertical motion if stuck to the rails that way
+        /*
+        if (!getRailLogic().hasVerticalMovement()) {
+            vel.setY(0.0);
+        }
+        */
+
+        this.directionFrom = this.directionTo;
+
         // Move using set motion, and perform post-move rail logic
-        this.onMove(motX, motY, motZ);
+        try (Timings t = TCTimings.MEMBER_PHYSICS_POST_MOVE.start()) {
+            if (this.preMovePosition == null) {
+                this.preMovePosition = entity.getLocation();
+            } else {
+                entity.getLocation(this.preMovePosition);
+            }
+            this.onMove(MoveType.SELF, vel.getX(), vel.getY(), vel.getZ());
+        }
+
         this.checkMissing();
-        this.getRailLogic().onPostMove(this);
+        try (Timings t = TCTimings.MEMBER_PHYSICS_POST_RAIL_LOGIC.start()) {
+            this.getRailLogic().onPostMove(this);
+        }
+
+        // Update manual movement from player input
+        updateManualMovement();
 
         // Post-move logic
         this.doPostMoveLogic();
         if (!this.isDerailed()) {
             // Slowing down of minecarts
-            if (this.getGroup().getProperties().isSlowingDown()) {
-                if (entity.hasPassenger() || !entity.isSlowWhenEmpty() || !TrainCarts.slowDownEmptyCarts) {
-                    entity.vel.multiply(TrainCarts.slowDownMultiplierNormal);
+            if (this.getGroup().getProperties().isSlowingDown(SlowdownMode.FRICTION)) {
+                if (entity.hasPassenger() || !entity.isSlowWhenEmpty() || !TCConfig.slowDownEmptyCarts) {
+                    entity.vel.multiply(TCConfig.slowDownMultiplierNormal);
                 } else {
-                    entity.vel.multiply(TrainCarts.slowDownMultiplierSlow);
+                    entity.vel.multiply(TCConfig.slowDownMultiplierSlow);
                 }
             }
         }
@@ -1113,9 +1779,6 @@ public abstract class MinecartMember<T extends CommonMinecart<?>> extends Entity
         // Perform post-movement rail logic
         getRailType().onPostMove(this);
 
-        // Update rotation
-        this.onRotationUpdate();
-
         // Invalidate volatile information
         getRailTracker().setLiveRailLogic();
 
@@ -1123,25 +1786,67 @@ public abstract class MinecartMember<T extends CommonMinecart<?>> extends Entity
         Location from = entity.getLastLocation();
         Location to = entity.getLocation();
         Vehicle vehicle = entity.getEntity();
-        CommonUtil.callEvent(new VehicleUpdateEvent(vehicle));
-        if (!from.equals(to)) {
+
+        try (Timings t = TCTimings.MEMBER_PHYSICS_POST_BUKKIT_UPDATE.start()) {
+            CommonUtil.callEvent(new VehicleUpdateEvent(vehicle));
+        }
+
+        if (from.getX() != to.getX() || from.getY() != to.getY() || from.getZ() != to.getZ()) {
             // Execute move events
-            CommonUtil.callEvent(new VehicleMoveEvent(vehicle, from, to));
-            for (org.bukkit.block.Block sign : this.getBlockTracker().getActiveSigns()) {
-                SignAction.executeAll(new SignActionEvent(sign, this), SignActionType.MEMBER_MOVE);
+            try (Timings t = TCTimings.MEMBER_PHYSICS_POST_BUKKIT_MOVE.start()) {
+                CommonUtil.callEvent(new VehicleMoveEvent(vehicle, from, to));
+            }
+
+            // Execute signs MEMBER_MOVE
+            try (Timings t = TCTimings.MEMBER_PHYSICS_POST_SIGN_MEMBER_MOVE.start()) {
+                Collection<TrackedSign> trackedSigns = this.getSignTracker().getActiveTrackedSigns();
+                if (!trackedSigns.isEmpty()) {
+                    for (TrackedSign sign : trackedSigns) {
+                        SignActionEvent event = new SignActionEvent(sign);
+                        event.setMember(this);
+                        SignAction.executeAll(event, SignActionType.MEMBER_MOVE);
+                    }
+                }
             }
         }
 
-        // Minecart collisions
-        for (Entity near : entity.getNearbyEntities(0.2, 0, 0.2)) {
-            if (near instanceof Minecart && near != this.entity.getPassenger()) {
+        // Performs linkage with nearby minecarts
+        // This allows trains to link before actually colliding
+        // Version 1.12.2-v3: only do this ONCE after placing/spawning to reduce cpu usage
+        if (!this.hasLinkedFarMinecarts) {
+            this.hasLinkedFarMinecarts = true;
+            for (Entity near : entity.getNearbyEntities(0.2, 0, 0.2)) {
+                if (near instanceof Minecart && !this.entity.isPassenger(near)) {
+                    EntityUtil.doCollision(near, this.entity.getEntity());
+                }
+            }
+        }
+
+        // Handle collisions for train lengths > 1.0 in a special way
+        
+        /*
+        if (this.getCartLength() > 1.0) {
+            double rad = 0.5 * this.getCartLength();
+            for (Entity near : entity.getNearbyEntities(rad, rad, rad)) {
+                // Skip near entities that are other minecarts in this same train
+                // Saves on performance handling collision events for all of them every tick
+                MinecartMember<?> nearMember = MinecartMemberStore.getFromEntity(near);
+                if (nearMember != null && nearMember.group == this.group) {
+                    continue;
+                }
+
+                // Verify by using the transform of this Minecart whether or not the entity is actually colliding
+                // We do so by performing a 
                 EntityUtil.doCollision(near, this.entity.getEntity());
             }
         }
+        */
 
         // Ensure that dead passengers are cleared
-        if (entity.hasPassenger() && entity.getPassenger().isDead()) {
-            entity.setPassenger(null);
+        for (Entity passenger : entity.getPassengers()) {
+            if (passenger.isDead()) {
+                entity.removePassenger(passenger);
+            }
         }
 
         // Final logic
@@ -1153,99 +1858,58 @@ public abstract class MinecartMember<T extends CommonMinecart<?>> extends Entity
 
     @Override
     public void onTick() {
+        this.ticked.set();
         if (this.isUnloaded()) {
             return;
         }
         MinecartGroup g = this.getGroup();
-        if (g == null) {
-            return;
-        }
-        if (entity.isDead()) {
-            // remove self
-            g.remove(this);
-        } else if (g.isEmpty()) {
-            g.remove();
-            super.onTick();
-        } else if (g.ticked.set()) {
+        if (g != null && g.ticked.set()) {
             g.doPhysics();
         }
     }
 
     /**
-     * Performs rotation updates for yaw and pitch
+     * Sets the current roll of the Minecart.
+     * This does not set the roll induced by shaking effects.
+     * 
+     * @param newroll
      */
-    public void onRotationUpdate() {
-        //Update yaw and pitch based on motion
-        final double movedX = entity.getMovedX();
-        final double movedY = entity.getMovedY();
-        final double movedZ = entity.getMovedZ();
-        final boolean movedXZ = Math.abs(movedX) > 0.001 || Math.abs(movedZ) > 0.001;
-        final float oldyaw = entity.loc.getYaw();
-        float newyaw = oldyaw;
-        float newpitch = entity.loc.getPitch();
-        boolean orientPitch = false;
-        if (isDerailed()) {
-            // Update yaw
-            if (Math.abs(movedX) > 0.01 || Math.abs(movedZ) > 0.01) {
-                newyaw = MathUtil.getLookAtYaw(movedX, movedZ);
-            }
-            // Update pitch
-            if (entity.isOnGround()) {
-                // Reduce pitch over time
-                if (Math.abs(newpitch) > 0.1) {
-                    newpitch *= 0.1;
-                } else {
-                    newpitch = 0;
-                }
-                orientPitch = true;
-            } else if (movedXZ && Math.abs(movedY) > 0.001) {
-                // Use movement for pitch (but only when moving horizontally)
-                newpitch = MathUtil.clamp(-0.7f * MathUtil.getLookAtPitch(-movedX, -movedY, -movedZ), 60.0f);
-                orientPitch = true;
-            }
-        } else {
-            // Update yaw
-            BlockFace dir = this.getDirection();
-            if (FaceUtil.isVertical(dir)) {
-                newyaw = FaceUtil.faceToYaw(this.getRailDirection());
-            } else {
-                newyaw = FaceUtil.faceToYaw(this.getDirection());
-            }
-            // Update pitch
-            if (getRailLogic() instanceof RailLogicVertical) {
-                newpitch = TrainCarts.allowVerticalPitch ? -90.0f : 0.0f;
-                orientPitch = true;
-            } else if (getRailLogic() instanceof RailLogicVerticalSlopeDown) {
-                newpitch = -45.0f;
-                orientPitch = true;
-            } else if (getRailLogic().isSloped()) {
-                if (movedXZ && Math.abs(movedY) > 0.001) {
-                    // Use movement for pitch (but only when moving horizontally)
-                    newpitch = MathUtil.clamp(-0.7f * MathUtil.getLookAtPitch(-movedX, -movedY, -movedZ), 60.0f);
-                    orientPitch = true;
-                }
-                // This was the old method, where pitch is inverted to make players look up/down properly
-                /*
-				newpitch = 0.8f * MathUtil.getLookAtPitch(movedX, movedY, movedZ);
-				orientPitch = false;
-				*/
-            } else {
-                newpitch = 0.0f;
-                orientPitch = true;
-            }
+    public void setRoll(double newroll) {
+        if (newroll != this.roll) {
+            this.roll = newroll;
         }
+    }
+
+    /**
+     * Gets the current roll of the Minecart.
+     * This includes roll induced by shaking effects.
+     * 
+     * @return roll angle
+     */
+    public double getRoll() {
+        double result = this.roll;
+        //TODO: Integrate shaking direction / shaking power into this roll value
+        return result + getWheels().getBankingRoll();
+    }
+
+    /**
+     * Sets the rotation of the Minecart, taking care of wrap-around of the angles
+     * 
+     * @param newyaw to set to
+     * @param newpitch to set to
+     * @param orientPitch
+     */
+    public void setRotationWrap(float newyaw, float newpitch) {
+        final float oldyaw = entity.loc.getYaw();
 
         // Fix yaw based on the previous yaw angle
-        if (MathUtil.getAngleDifference(oldyaw, newyaw) > 90.0f) {
-            while ((newyaw - oldyaw) >= 90.0f) {
-                newyaw -= 180.0f;
-            }
-            while ((newyaw - oldyaw) < -90.0f) {
-                newyaw += 180.0f;
-            }
-            if (orientPitch) {
-                newpitch = -newpitch;
-            }
+        while ((newyaw - oldyaw) >= 90.0f) {
+            newyaw -= 180.0f;
+            newpitch = -newpitch;
+        }
+        while ((newyaw - oldyaw) < -90.0f) {
+            newyaw += 180.0f;
+            newpitch = -newpitch;
         }
 
         // Fix up wrap-around angles
@@ -1261,7 +1925,14 @@ public abstract class MinecartMember<T extends CommonMinecart<?>> extends Entity
 
     @Override
     public String getLocalizedName() {
-        return isSingle() ? "Minecart" : "Train";
+        String name = super.getLocalizedName();
+        if (name == null || name.equals("unknown")) {
+            name = "Minecart"; // Bug with older BKCommonLib!
+        }
+        if (!isSingle()) {
+            name += " (Train)";
+        }
+        return name;
     }
 
     @Override
@@ -1272,5 +1943,120 @@ public abstract class MinecartMember<T extends CommonMinecart<?>> extends Entity
     @Override
     public boolean parseSet(String key, String args) {
         return false;
+    }
+
+    /**
+     * Gets the number of seats still available for new entities to enter the minecart
+     * 
+     * @return number of available seats
+     */
+    public int getAvailableSeatCount() {
+        int total = this.getSeatCount();
+        int passengers = this.entity.getPassengers().size();
+        if (passengers >= total) {
+            return 0;
+        } else {
+            return total - passengers;
+        }
+    }
+
+    /**
+     * Gets the number of seats available in this Minecart.
+     * This is based on the model attachments applied if a model is used.
+     * Otherwise, it simply returns 1 when this is a rideable minecart.
+     * 
+     * @return seat count
+     */
+    public int getSeatCount() {
+        AttachmentModel model = this.getProperties().getModel();
+        if (model == null) {
+            return (entity.getType() == EntityType.MINECART) ? 1 : 0;
+        } else {
+            return model.getSeatCount();
+        }
+    }
+
+    /**
+     * Calculates the preferred distance between the center of this Minecart
+     * and the member specified. By playing with the speed of the two carts,
+     * this distance is maintained steady.
+     * 
+     * @param member
+     * @return preferred distance
+     */
+    public double getPreferredDistance(MinecartMember<?> member) {
+        return 0.5 * ((double) entity.getWidth() + (double) member.getEntity().getWidth()) + TCConfig.cartDistanceGap;
+    }
+
+    /**
+     * Calculates the maximum distance between the center of this Minecart
+     * and the member specified. If the distance between them exceeds this value,
+     * the two Minecarts lose linkage.
+     * 
+     * @param member
+     * @return maximum distance
+     */
+    public double getMaximumDistance(MinecartMember<?> member) {
+        return 0.5 * ((double) entity.getWidth() + (double) member.getEntity().getWidth()) + TCConfig.cartDistanceGapMax;
+    }
+
+    /**
+     * Calculates the maximum amount of block iterations between the center of this Minecart
+     * and the member specified that should be performed when discovering rails. Generally
+     * aiming too high is not a big deal, this is only here to prevent infinite cycles from
+     * crashing the server.
+     * 
+     * @param member
+     * @return maximum block iteration around
+     */
+    public int getMaximumBlockDistance(MinecartMember<?> member) {
+        return MathUtil.ceil(2.0 * getMaximumDistance(member));
+    }
+
+    /**
+     * Gets a rotated 3D hitbox, which can be used to test whether a player's click is on this entity
+     * 
+     * @return click hitbox
+     */
+    public CollisionBox getHitBox() {
+        CollisionBox box = new CollisionBox();
+        box.setPosition(this.getWheels().getPosition());
+        box.setRadius(1.0, 1.0, this.entity.getWidth());
+        box.setOrientation(this.getOrientation());
+        return box;
+    }
+
+    /**
+     * Detect changes in Minecart position since the last time rail information was refreshed.
+     * 
+     * @return True if position changed
+     */
+    boolean railDetectPositionChange() {
+        Vector nvel = entity.vel.vector();
+        double fact = MathUtil.getNormalizationFactor(nvel);
+        if (fact != Double.POSITIVE_INFINITY && !Double.isNaN(fact)) {
+            nvel.multiply(fact);
+        }
+        if (this.lastRailRefreshPosition == null || this.lastRailRefreshDirection == null) {
+            this.lastRailRefreshPosition = entity.loc.vector();
+            this.lastRailRefreshDirection = entity.vel.vector().normalize();
+            return true;
+        } else if (this.lastRailRefreshPosition.getX() != entity.loc.getX() ||
+                   this.lastRailRefreshPosition.getY() != entity.loc.getY() ||
+                   this.lastRailRefreshPosition.getZ() != entity.loc.getZ() ||
+                   this.lastRailRefreshDirection.getX() != nvel.getX() ||
+                   this.lastRailRefreshDirection.getY() != nvel.getY() ||
+                   this.lastRailRefreshDirection.getZ() != nvel.getZ())
+        {
+            this.lastRailRefreshPosition.setX(entity.loc.getX());
+            this.lastRailRefreshPosition.setY(entity.loc.getY());
+            this.lastRailRefreshPosition.setZ(entity.loc.getZ());
+            this.lastRailRefreshDirection.setX(nvel.getX());
+            this.lastRailRefreshDirection.setY(nvel.getY());
+            this.lastRailRefreshDirection.setZ(nvel.getZ());
+            return true;
+        } else {
+            return false;
+        }
     }
 }

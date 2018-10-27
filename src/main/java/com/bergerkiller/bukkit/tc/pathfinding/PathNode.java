@@ -7,10 +7,9 @@ import com.bergerkiller.bukkit.common.config.CompressedDataReader;
 import com.bergerkiller.bukkit.common.config.CompressedDataWriter;
 import com.bergerkiller.bukkit.common.utils.LogicUtil;
 import com.bergerkiller.bukkit.common.utils.StringUtil;
-import com.bergerkiller.bukkit.tc.Util;
 import com.bergerkiller.bukkit.tc.events.SignActionEvent;
+
 import org.bukkit.block.Block;
-import org.bukkit.block.BlockFace;
 
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
@@ -18,25 +17,30 @@ import java.io.IOException;
 import java.util.*;
 
 public class PathNode {
+    static final String SWITCHER_NAME_FALLBACK = "::traincarts::switchable::";
+    private static boolean hasChanges = false;
     private static BlockMap<PathNode> blockNodes = new BlockMap<>();
     private static Map<String, PathNode> nodes = new HashMap<>();
     public final BlockLocation location;
     private final Set<String> names = new HashSet<>();
     private final List<PathConnection> neighbors = new ArrayList<>(3);
     public int index;
-    private int lastDistance;
+    private double lastDistance;
     private PathConnection lastTaken;
+    private boolean isRailSwitchable;
 
     private PathNode(final String name, final BlockLocation location) {
         this.location = location;
         if (!LogicUtil.nullOrEmpty(name)) {
             LogicUtil.addArray(this.names, name.split("\n", -1));
         }
+        this.refreshRailSwitchable();
     }
 
     public static void clearAll() {
         nodes.clear();
         blockNodes.clear();
+        hasChanges = true;
     }
 
     /**
@@ -46,24 +50,18 @@ public class PathNode {
         BlockSet blocks = new BlockSet();
         blocks.addAll(blockNodes.keySet());
         clearAll();
-        String name;
-        SignActionEvent info;
+
         for (BlockLocation location : blocks) {
-            name = location.toString();
-            // Destination sign? If so, fix up the name
-            Block block = location.getBlock();
-            if (block == null) {
-                continue;
-            }
-            for (Block signBlock : Util.getSignsFromRails(block)) {
-                info = new SignActionEvent(signBlock);
-                if (info.getSign() != null && info.isType("destination")) {
-                    name = info.getLine(2);
-                    break;
-                }
-            }
-            getOrCreate(name, location);
+            PathProvider.discover(location);
         }
+    }
+
+    public static Collection<PathNode> getAll() {
+        return nodes.values();
+    }
+
+    public static PathNode get(BlockLocation railLocation) {
+        return blockNodes.get(railLocation);
     }
 
     public static PathNode get(Block block) {
@@ -137,14 +135,11 @@ public class PathNode {
         return node;
     }
 
-    private static int getDistanceTo(PathConnection from, PathConnection conn, int currentDistance, int maxDistance, PathNode destination) {
+    private static double getDistanceTo(PathConnection from, PathConnection conn, double currentDistance, double maxDistance, PathNode destination) {
         final PathNode node = conn.destination;
         currentDistance += conn.distance;
         // Consider taking turns as one distance longer
         // This avoids the excessive use of turns in 2-way 'X' intersections
-        if (from.direction != conn.direction) {
-            currentDistance++;
-        }
         if (destination == node) {
             return currentDistance;
         }
@@ -154,7 +149,7 @@ public class PathNode {
         }
         node.lastDistance = currentDistance;
         // Check all neighbors and obtain the lowest distance recursively
-        int distance;
+        double distance;
         for (PathConnection connection : node.neighbors) {
             distance = getDistanceTo(conn, connection, currentDistance, maxDistance, destination);
             if (maxDistance > distance) {
@@ -195,9 +190,13 @@ public class PathNode {
                 }
             }
         }.read();
+        hasChanges = false;
     }
 
-    public static void save(String filename) {
+    public static void save(boolean autosave, String filename) {
+        if (autosave && !hasChanges) {
+            return;
+        }
         new CompressedDataWriter(filename) {
             public void write(DataOutputStream stream) throws IOException {
                 stream.writeInt(nodes.size());
@@ -225,6 +224,7 @@ public class PathNode {
                 }
             }
         }.write();
+        hasChanges = false;
     }
 
     /**
@@ -249,11 +249,11 @@ public class PathNode {
             node.lastDistance = Integer.MAX_VALUE;
             node.lastTaken = null;
         }
-        int maxDistance = Integer.MAX_VALUE;
-        int distance;
-        final PathConnection from = new PathConnection(this, 0, BlockFace.SELF);
+        double maxDistance = Integer.MAX_VALUE;
+        double distance;
+        final PathConnection from = new PathConnection(this, 0, "");
         for (PathConnection connection : this.neighbors) {
-            distance = getDistanceTo(from, connection, 0, maxDistance, destination);
+            distance = getDistanceTo(from, connection, 0.0, maxDistance, destination);
             if (maxDistance > distance) {
                 maxDistance = distance;
                 this.lastTaken = connection;
@@ -262,7 +262,7 @@ public class PathNode {
         if (this.lastTaken == null) {
             return null;
         } else {
-            return new PathConnection(destination, maxDistance, this.lastTaken.direction);
+            return new PathConnection(destination, maxDistance, this.lastTaken.junctionName);
         }
     }
 
@@ -291,10 +291,10 @@ public class PathNode {
      *
      * @param to        the node to make a connection with
      * @param distance  of the connection
-     * @param direction of the connection
+     * @param junctionName of the connection
      * @return The connection that was made
      */
-    public PathConnection addNeighbour(final PathNode to, final int distance, final BlockFace direction) {
+    public PathConnection addNeighbour(final PathNode to, final double distance, final String junctionName) {
         PathConnection conn;
         Iterator<PathConnection> iter = this.neighbors.iterator();
         while (iter.hasNext()) {
@@ -311,8 +311,9 @@ public class PathNode {
             }
         }
         // Add a new one
-        conn = new PathConnection(to, distance, direction);
+        conn = new PathConnection(to, distance, junctionName);
         this.neighbors.add(conn);
+        hasChanges = true;
         return conn;
     }
 
@@ -326,6 +327,7 @@ public class PathNode {
                 }
             }
         }
+        hasChanges = true;
     }
 
     /**
@@ -338,7 +340,9 @@ public class PathNode {
         if (!this.names.remove(name)) {
             return;
         }
+        this.refreshRailSwitchable();
         nodes.remove(name);
+        hasChanges = true;
         if (PathProvider.DEBUG_MODE) {
             String dbg = "NODE " + location + " NO LONGER HAS NAME " + name;
             if (this.names.isEmpty()) {
@@ -361,6 +365,7 @@ public class PathNode {
             nodes.remove(name);
         }
         blockNodes.remove(this.location);
+        hasChanges = true;
     }
 
     /**
@@ -389,7 +394,13 @@ public class PathNode {
      * @return True if a switcher sign is contained, False if not
      */
     public boolean containsSwitcher() {
-        return this.names.contains(this.location.toString());
+        return this.isRailSwitchable;
+    }
+
+    // Detect based on node names whether this node's tracks can be switched
+    private void refreshRailSwitchable() {
+        this.isRailSwitchable = this.names.contains(this.location.toString()) ||
+                                this.names.contains(SWITCHER_NAME_FALLBACK);
     }
 
     /**
@@ -446,14 +457,21 @@ public class PathNode {
 
     public void addName(String name) {
         if (this.names.add(name)) {
-            nodes.put(name, this);
+            this.refreshRailSwitchable();
+            if (!PathNode.SWITCHER_NAME_FALLBACK.equals(name)) {
+                nodes.put(name, this);
+            }
+            hasChanges = true;
         }
     }
 
     private void addToMapping() {
         for (String name : this.names) {
-            nodes.put(name, this);
+            if (!PathNode.SWITCHER_NAME_FALLBACK.equals(name)) {
+                nodes.put(name, this);
+            }
         }
         blockNodes.put(this.location, this);
+        hasChanges = true;
     }
 }

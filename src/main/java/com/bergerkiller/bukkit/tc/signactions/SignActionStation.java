@@ -42,7 +42,9 @@ public class SignActionStation extends SignAction {
         if (station.getInstruction() == null) {
             // Clear actions, but only if requested to do so because of a redstone change
             if (info.isAction(SignActionType.REDSTONE_CHANGE)) {
-                info.getGroup().getActions().clear();
+                if (info.getGroup().getActions().isCurrentActionTag(station.getTag())) {
+                    info.getGroup().getActions().clear();
+                }
             }
         } else if (station.getInstruction() == BlockFace.SELF) {
             MinecartMember<?> centerMember = station.getCenterCart();
@@ -53,8 +55,8 @@ public class SignActionStation extends SignAction {
 
             //Brake
             //TODO: ADD CHECK?!
-            group.getActions().clear();
-            BlockFace trainDirection = station.getNextDirection().getDirection(info.getFacing(), info.getMember().getDirection());
+            group.getActions().launchReset();
+            BlockFace trainDirection = station.getNextDirectionFace();
             if (station.getNextDirection() != Direction.NONE) {
                 // Actual launching here
                 if (station.hasDelay()) {
@@ -64,30 +66,29 @@ public class SignActionStation extends SignAction {
                     // Order the train to center prior to launching again
                     station.centerTrain();
                 }
-                station.launchTo(trainDirection, station.getLength());
+                station.launchTo(trainDirection);
             } else {
                 station.centerTrain();
                 station.waitTrain(Long.MAX_VALUE);
             }
         } else {
             //Launch
-            group.getActions().clear();
-            MinecartMember<?> head = group.head();
+            group.getActions().launchReset();
 
-            if (station.hasDelay() || (head.isMoving() && !info.getMember().isDirectionTo(station.getInstruction()))) {
+            if (station.hasDelay() || (group.head().isMoving() && !info.getMember().isDirectionTo(station.getInstruction()))) {
                 //Reversing or has delay, need to center it in the middle first
                 station.centerTrain();
             }
             if (station.hasDelay()) {
                 station.waitTrain(station.getDelay());
             }
-            station.launchTo(station.getInstruction(), station.getLength());
+            station.launchTo(station.getInstruction());
         }
     }
 
     @Override
     public boolean build(SignChangeActionEvent event) {
-        return event.getMode() != SignActionMode.NONE && handleBuild(event, Permission.BUILD_STATION, "station", "stop, wait and launch trains");
+        return handleBuild(event, Permission.BUILD_STATION, "station", "stop, wait and launch trains");
     }
 
     @Override

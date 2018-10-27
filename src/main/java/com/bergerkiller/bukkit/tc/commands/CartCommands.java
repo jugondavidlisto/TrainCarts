@@ -13,6 +13,7 @@ import com.bergerkiller.bukkit.tc.Util;
 import com.bergerkiller.bukkit.tc.controller.MinecartMember;
 import com.bergerkiller.bukkit.tc.properties.CartProperties;
 import com.bergerkiller.bukkit.tc.properties.CartPropertiesStore;
+import com.bergerkiller.bukkit.tc.properties.TrainPropertiesStore;
 import com.bergerkiller.bukkit.tc.signactions.SignActionBlockChanger;
 import com.bergerkiller.bukkit.tc.storage.OfflineGroupManager;
 import org.bukkit.ChatColor;
@@ -29,6 +30,7 @@ import java.util.Set;
 public class CartCommands {
 
     public static boolean execute(Player p, CartProperties prop, String cmd, String[] args) throws NoPermissionException {
+        TrainPropertiesStore.markForAutosave();
         if (cmd.equals("info") || cmd.equals("i")) {
             info(p, prop);
         } else if (cmd.equals("playerenter")) {
@@ -169,7 +171,7 @@ public class CartCommands {
                     for (int i = 0; i < count; i++) {
                         Material mat = ParseUtil.parseMaterial(args[i], null);
                         if (mat != null) {
-                            if (p.hasPermission("train.command.break.admin") || TrainCarts.canBreak(mat)) {
+                            if (Permission.COMMAND_BREAKBLOCK_ADMIN.has(p) || TrainCarts.canBreak(mat)) {
                                 mats.add(mat);
                             } else {
                                 p.sendMessage(ChatColor.RED + "You are not allowed to make this cart break '" + mat.toString() + "'!");
@@ -216,7 +218,7 @@ public class CartCommands {
             } else {
                 List<MinecartMember<?>> members = new ArrayList<>(1);
                 members.add(member);
-                SignActionBlockChanger.setBlocks(members, StringUtil.join(" ", args));
+                SignActionBlockChanger.setBlocks(members, StringUtil.join(" ", args), SignActionBlockChanger.BLOCK_OFFSET_NONE);
                 p.sendMessage(ChatColor.YELLOW + "The selected minecart has its displayed block updated!");
             }
         } else if (LogicUtil.contains(cmd, "setblockoffset", "changeblockoffset", "blockoffset")) {

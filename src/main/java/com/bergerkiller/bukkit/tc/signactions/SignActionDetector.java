@@ -7,7 +7,7 @@ import com.bergerkiller.bukkit.common.utils.CommonUtil;
 import com.bergerkiller.bukkit.common.utils.FaceUtil;
 import com.bergerkiller.bukkit.common.utils.StreamUtil;
 import com.bergerkiller.bukkit.tc.Permission;
-import com.bergerkiller.bukkit.tc.TrainCarts;
+import com.bergerkiller.bukkit.tc.TCConfig;
 import com.bergerkiller.bukkit.tc.Util;
 import com.bergerkiller.bukkit.tc.detector.DetectorRegion;
 import com.bergerkiller.bukkit.tc.events.SignActionEvent;
@@ -26,22 +26,52 @@ import java.util.Set;
 import java.util.UUID;
 
 public class SignActionDetector extends SignAction {
-    private static BlockMap<DetectorSignPair> detectors = new BlockMap<>();
+    private static boolean hasChanges = false;
+    public static final SignActionDetector INSTANCE = new SignActionDetector();
+    private final BlockMap<DetectorSignPair> detectors = new BlockMap<>();
 
-    public static void removeDetector(Block at) {
-        DetectorSignPair dec = detectors.get(at);
-        if (dec != null) {
-            detectors.remove(at.getWorld(), dec.sign1.getLocation());
-            detectors.remove(at.getWorld(), dec.sign2.getLocation());
-            dec.region.remove();
+    @Override
+    public boolean match(SignActionEvent info) {
+        return info != null && info.getMode() != SignActionMode.NONE && info.isType("detect");
+    }
+
+    /**
+     * Matches the sign to check that it is indeed a detector sign. If labels are used on either
+     * sign, then the labels must match as well. If label is null, but the sign has a label, then
+     * the signs do not match.
+     * 
+     * @param info sign information
+     * @param label to match, null to not check for this label
+     * @return True if the sign is a detector sign with the same label
+     */
+    public boolean matchLabel(SignActionEvent info, String label) {
+        if (!match(info)) {
+            return false;
         }
+        String otherLabel = getLabel(info);
+        return (label == null) ? (otherLabel == null) : label.equalsIgnoreCase(otherLabel);
     }
 
-    public static boolean isValid(SignActionEvent event) {
-        return event != null && event.getMode() != SignActionMode.NONE && event.isType("detector");
+    /**
+     * Reads the label put on the second line of the detector sign.
+     * This label is used to uniquely pair two detector signs when multiple
+     * exist on the same tracks.
+     * 
+     * @param info to read
+     * @return detector sign label
+     */
+    public String getLabel(SignActionEvent info) {
+        String data = info.getLine(1);
+        int index = Util.minStringIndex(data.indexOf(' '), data.indexOf(':'));
+        return (index == -1) ? null : data.substring(index + 1).trim();
     }
 
-    public static void init(String filename) {
+    /**
+     * Loads all detector sign regions from the state file.
+     * 
+     * @param filename of the file to load the state information from
+     */
+    public void init(String filename) {
         detectors.clear();
         new DataReader(filename) {
             public void read(DataInputStream stream) throws IOException {
@@ -59,9 +89,18 @@ public class SignActionDetector extends SignAction {
                 }
             }
         }.read();
+        hasChanges = false;
     }
 
-    public static void save(String filename) {
+    /**
+     * Saves all detector sign regions to a state file
+     * 
+     * @param filename of the file to save the state information to
+     */
+    public void save(boolean autosave, String filename) {
+        if (autosave && !hasChanges) {
+            return;
+        }
         new DataWriter(filename) {
             public void write(DataOutputStream stream) throws IOException {
                 Set<DetectorSignPair> detectorset = new HashSet<>(detectors.size() / 2);
@@ -75,21 +114,23 @@ public class SignActionDetector extends SignAction {
                 }
             }
         }.write();
-    }
-
-    @Override
-    public boolean match(SignActionEvent info) {
-        return isValid(info);
+        hasChanges = false;
     }
 
     @Override
     public void execute(SignActionEvent info) {
         //nothing happens here, relies on rail detector events
+
+        // I lied! We have to double-check a detector region for this detector sign exists
+        // Just in case data is corrupted, it can be restored by the first train driving over the detector
+        if (info.getAction().isRedstone() || info.isAction(SignActionType.GROUP_ENTER)) {
+            handlePlacement(info, false);
+        }
     }
 
     @Override
     public boolean build(SignChangeActionEvent event) {
-        if (!isValid(event)) {
+        if (!match(event)) {
             return false;
         }
         if (handleBuild(event, Permission.BUILD_DETECTOR, "train detector", "detect trains between this detector sign and another")) {
@@ -98,17 +139,10 @@ public class SignActionDetector extends SignAction {
                 event.getPlayer().sendMessage(ChatColor.RED + "No rails are nearby: This detector sign has not been activated!");
                 return true;
             }
-            Block startsign = event.getBlock();
-            Block startrails = event.getRails();
-            BlockFace dir = event.getFacing();
-            if (!tryBuild(startrails, startsign, dir)) {
-                if (!tryBuild(startrails, startsign, FaceUtil.rotate(dir, 2))) {
-                    if (!tryBuild(startrails, startsign, FaceUtil.rotate(dir, -2))) {
-                        event.getPlayer().sendMessage(ChatColor.RED + "Failed to find a second detector sign: No region set.");
-                        event.getPlayer().sendMessage(ChatColor.YELLOW + "Place a second connected detector sign to finish this region!");
-                        return true;
-                    }
-                }
+            if (!handlePlacement(event, true)) {
+                event.getPlayer().sendMessage(ChatColor.RED + "Failed to find a second detector sign: No region set.");
+                event.getPlayer().sendMessage(ChatColor.YELLOW + "Place a second connected detector sign to finish this region!");
+                return true;
             }
             event.getPlayer().sendMessage(ChatColor.GREEN + "A second detector sign was found: Region set.");
             return true;
@@ -118,33 +152,76 @@ public class SignActionDetector extends SignAction {
 
     @Override
     public void destroy(SignActionEvent info) {
-        removeDetector(info.getBlock());
+        Block at = info.getBlock();
+        DetectorSignPair dec = detectors.get(at);
+        if (dec != null) {
+            detectors.remove(at.getWorld(), dec.sign1.getLocation());
+            detectors.remove(at.getWorld(), dec.sign2.getLocation());
+            dec.region.remove();
+            hasChanges = true;
+        }
     }
 
-    public boolean tryBuild(Block startrails, Block startsign, BlockFace direction) {
-        final TrackMap map = new TrackMap(startrails, direction, TrainCarts.maxDetectorLength);
+    private boolean handlePlacement(SignActionEvent event, boolean signBuilt) {
+        if (!event.hasRails()) {
+            return false;
+        }
+        Block startsign = event.getBlock();
+        Block startrails = event.getRails();
+        BlockFace dir = event.getFacing();
+        String label = getLabel(event);
+        if (!tryBuild(label, startrails, startsign, dir, signBuilt)) {
+            if (!tryBuild(label, startrails, startsign, FaceUtil.rotate(dir, 2), signBuilt)) {
+                if (!tryBuild(label, startrails, startsign, FaceUtil.rotate(dir, -2), signBuilt)) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    public boolean tryBuild(String label, Block startrails, Block startsign, BlockFace direction, boolean signBuilt) {
+        DetectorSignPair detector = null;
+        if (!signBuilt) {
+            detector = detectors.get(startsign);
+        }
+        if (detector == null) {
+            detector = createPair(label, startrails, startsign, direction);
+        }
+        return detector != null;
+    }
+
+    private DetectorSignPair createPair(String label, Block startrails, Block startsign, BlockFace direction) {
+        final TrackMap map = new TrackMap(startrails, direction, TCConfig.maxDetectorLength);
         map.next();
         //now try to find the end rails : find the other sign
         Block endsign;
         SignActionEvent info;
         while (map.hasNext()) {
             for (Block signblock : Util.getSignsFromRails(map.next())) {
+                if (signblock.equals(startsign)) {
+                    continue;
+                }
                 info = new SignActionEvent(signblock);
-                if (match(info)) {
+                if (matchLabel(info, label)) {
                     endsign = signblock;
+
                     //start and end found : add it
                     final DetectorSignPair detector = new DetectorSignPair(startsign, endsign);
                     detectors.put(startsign, detector);
                     detectors.put(endsign, detector);
+                    hasChanges = true;
                     CommonUtil.nextTick(new Runnable() {
                         public void run() {
-                            DetectorRegion.create(map).register(detector);
+                            DetectorRegion region = DetectorRegion.create(map);
+                            region.register(detector);
+                            region.detectMinecarts();
                         }
                     });
-                    return true;
+                    return detector;
                 }
             }
         }
-        return false;
+        return null;
     }
 }

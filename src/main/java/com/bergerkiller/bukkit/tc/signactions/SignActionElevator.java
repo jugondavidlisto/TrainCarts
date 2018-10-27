@@ -4,11 +4,16 @@ import com.bergerkiller.bukkit.common.utils.BlockUtil;
 import com.bergerkiller.bukkit.common.utils.FaceUtil;
 import com.bergerkiller.bukkit.common.utils.ParseUtil;
 import com.bergerkiller.bukkit.tc.Permission;
+import com.bergerkiller.bukkit.tc.SignActionHeader;
 import com.bergerkiller.bukkit.tc.Util;
 import com.bergerkiller.bukkit.tc.events.SignActionEvent;
 import com.bergerkiller.bukkit.tc.events.SignChangeActionEvent;
+import com.bergerkiller.bukkit.tc.rails.type.RailType;
 import com.bergerkiller.bukkit.tc.utils.BlockTimeoutMap;
 import com.bergerkiller.bukkit.tc.utils.TrackIterator;
+
+import java.util.Locale;
+
 import org.bukkit.block.Block;
 import org.bukkit.block.BlockFace;
 import org.bukkit.block.Sign;
@@ -18,8 +23,8 @@ public class SignActionElevator extends SignAction {
     public static BlockTimeoutMap ignoreTimes = new BlockTimeoutMap();
 
     public static boolean isElevator(Sign sign) {
-        if (SignActionMode.fromSign(sign) != SignActionMode.NONE) {
-            if (sign.getLine(1).toLowerCase().startsWith("elevator")) {
+        if (SignActionHeader.parseFromSign(sign).isValid()) {
+            if (Util.getCleanLine(sign, 1).toLowerCase(Locale.ENGLISH).startsWith("elevator")) {
                 return true;
             }
         }
@@ -115,7 +120,7 @@ public class SignActionElevator extends SignAction {
         }
 
         // Facing towards a rail direction?
-        BlockFace[] startDirs = FaceUtil.getFaces(BlockUtil.getRails(dest).getDirection().getOppositeFace());
+        BlockFace[] startDirs = RailType.getType(dest).getPossibleDirections(dest);
         BlockFace launchDir = null;
         if (destsign != null) {
             BlockFace signdir = ((Directional) destsign.getData()).getFacing();
@@ -134,6 +139,6 @@ public class SignActionElevator extends SignAction {
 
     @Override
     public boolean build(SignChangeActionEvent event) {
-        return event.getMode() != SignActionMode.NONE && handleBuild(event, Permission.BUILD_ELEVATOR, "train elevator", "teleport trains vertically");
+        return handleBuild(event, Permission.BUILD_ELEVATOR, "train elevator", "teleport trains vertically");
     }
 }
